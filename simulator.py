@@ -25,7 +25,7 @@ centerline = np.vectorize(
 
 
 class Simulator:
-    def __init__(self):
+    def __init__(self, controller_callback=None):
         """initializes a Simulator
 
         Args:
@@ -41,8 +41,20 @@ class Simulator:
         self._steering_limits = (-0.7, 0.7)
         self._accel_limits = (-10, 4)
         self._steering_vel_limits = (-1, 1)
+        if controller_callback is not None:
+            self.cb = controller_callback
     def set_controller(self, controller_callback):
         self.cb = controller_callback
+    
+    @property
+    def centerline(self):
+        """get track centerline function.
+        
+        Returns:
+            function: centerline function that takes distance and returns (x, y) coordinates.
+        """
+        return centerline
+    
     @property
     def cones(self):
         """get all cone locations.
@@ -78,6 +90,203 @@ class Simulator:
     @property
     def car_vertices(self):
         return self.car_outline
+    
+    class Polygon:
+        
+        #vertices should be an (N, 2) array of points
+        def __init__(self, vertices: np.ndarray):
+            self.cx = np.mean(vertices[:, 0])
+            self.cy = np.mean(vertices[:, 1])
+
+            self.points = vertices
+            self.edges = self.create_edges(vertices)
+            
+            self.circle = []
+            self.circle.append(self.create_circles_with_triangle_vert())
+
+        def create_edges(self, vertices):
+            
+            # edge should be a (p1, p2) tuple
+            edges = []
+            for i in range(len(vertices)):
+                p1 = vertices[i]
+                p2 = vertices[(i + 1) % len(vertices)]
+                edges.append((p1, p2))
+            return edges
+        
+        def check_inside_polygon (self, point):
+            #checks for edges that are to the right of the selected point, and the intersection of a imaginary ray to the right
+            # odd intersections means inside, even means outside
+            x, y = point
+            intercept_count = 0
+            for i in self.edges:
+                p1, p2 = i
+                x1, y1 = p1[0], p1[1]  
+                x2, y2 = p2[0], p2[1]
+
+                if min(y1, y2) < y <= max(y1, y2) and x <= max(x1, x2):
+                    if y1 != y2:
+                        xintercept = (y - y1) * (x2 - x1) / (y2 - y1) + x1
+                    if x1 == x2 or x <= xintercept:
+                        intercept_count += 1
+
+            inside = (intercept_count % 2 == 1)
+            return inside
+        
+        def create_circles_with_triangle_vert(self):
+            #circle should be a (x, y, r) 
+            if len(self.points) == 3:
+                (x1, y1), (x2, y2), (x3, y3) = self.points
+                
+                D = 2 * (x1*(y2 - y3) + x2*(y3 - y1) + x3*(y1 - y2))
+                
+                # Fix 2: Guard against collinear points (D == 0)
+                if D == 0:
+                    return None
+                
+                x_c = ((x1**2 + y1**2)*(y2 - y3) +
+                        (x2**2 + y2**2)*(y3 - y1) +
+                        (x3**2 + y3**2)*(y1 - y2)) / D
+
+                y_c = ((x1**2 + y1**2)*(x3 - x2) +
+                        (x2**2 + y2**2)*(x1 - x3) +
+                        (x3**2 + y3**2)*(x2 - x1)) / D
+
+                r = np.sqrt((x_c - x1)**2 + (y_c - y1)**2)
+
+                return (x_c, y_c, r)
+            
+            else:
+                pass
+
+        def check_inside_circle(self, point):
+            for i in self.circle:
+                if i is None:  # Handle collinear triangles
+                    continue
+                x_c, y_c, r = i
+                x, y = point
+                if (x - x_c)**2 + (y - y_c)**2 < r**2:
+                    return True
+            return False        
+
+                
+   
+    def del_triangulation(self):
+        """Create a bounding triangle that contains all points."""
+        # Find bounding box of all points
+        maxx, minx, maxy, miny = -np.inf, np.inf, -np.inf, np.inf
+        point_count = 0
+        
+
+        for i in self.cones:
+            maxx = max(maxx, i[0])
+            minx = min(minx, i[0])
+            maxy = max(maxy, i[1])
+            miny = min(miny, i[1])
+        
+        # Add padding to ensure all points are inside
+        width = 50 * (maxx - minx)
+        height = 50 * (maxy - miny)
+        padding = 0.1 * max(width, height)  
+        
+
+        triangle_vertices = np.array([
+            [minx - padding, miny - padding],  # Bottom-left
+            [maxx + padding, miny - padding],  # Bottom-right
+            [np.mean([minx, maxx ]), maxy + padding]   # Top-left (forms right angle)
+        ])
+        
+        start_tri = self.Polygon(triangle_vertices)
+        polygon_list = [start_tri]
+
+        while point_count < len(self.cones):
+            poly_index = []
+            #pick new point and see if it is in anyones circle
+
+            for index, tri in enumerate(polygon_list):
+                
+                if tri.check_inside_circle(self.cones[point_count]):
+                    # Split triangle into 3 new triangles
+                    poly_index.append(index)
+                    
+            
+            edges = []
+            #for all circles that have the point within them, delete the polygon but keep the good edges
+            for index in poly_index:
+                tri = polygon_list[index]
+                for e in tri.edges:
+                    e_sorted = tuple(sorted(map(tuple, e)))  # normalize
+                    if e_sorted in edges:
+                        edges.remove(e_sorted)  # shared edge = discard
+                    else:
+                        edges.append(e_sorted)  # unique edge = keep
+            
+            # delete the polygons after the important edges are found and recorded within edges
+            for index in sorted(poly_index, reverse=True):
+                del polygon_list[index]
+
+
+            #polygonal hole is made with saved edges and deleted polygons, connect verticies of plygonal hole with new point to make new tris
+            new_point = self.cones[point_count]
+            for edge in edges:
+                p1, p2 = edge
+                # Fix 3: Explicitly cast back to np.array to avoid mixed types
+                p1 = np.array(p1)
+                p2 = np.array(p2)
+                new_polygon = self.Polygon(np.array([p1, p2, new_point]))
+                polygon_list.append(new_polygon)
+
+                
+
+
+            point_count += 1
+
+        del polygon_list[0]  # remove the starting triangle
+        
+        # Fix 1: Remove triangles containing super-triangle vertices
+        super_verts = triangle_vertices.tolist()
+        polygon_list = [
+            t for t in polygon_list
+            if not any((p.tolist() in super_verts) for p in t.points)
+        ]
+        
+        def clean_triangulation(polygon_list, points):
+            cleaned = []
+            seen = set()
+
+            for poly in polygon_list:
+                if len(poly.points) != 3:
+                    continue
+                circle = poly.create_circles_with_triangle_vert()
+                if circle is None:
+                    continue
+                x_c, y_c, r = circle
+
+                # Check if any point lies strictly inside this circle
+                bad = False
+                for p in points:
+                    if any(np.allclose(p, v) for v in poly.points):
+                        continue  # skip triangle’s own vertices
+                    if (p[0]-x_c)**2 + (p[1]-y_c)**2 < (r**2 - 1e-9):  # tolerance
+                        bad = True
+                        break
+
+                if not bad:
+                    # Deduplicate using a frozenset of tuples
+                    key = frozenset(map(tuple, poly.points))
+                    if key not in seen:
+                        seen.add(key)
+                        cleaned.append(poly)
+
+            return cleaned
+        
+        self.polygons = clean_triangulation(polygon_list,self.cones)
+
+
+        
+
+        
+
     def R(self, theta):
         """SO(2) matrix constructor
 

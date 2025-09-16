@@ -115,3 +115,6 @@ outside of [office hours](https://docs.google.com/spreadsheets/d/1ifnzajpgu3X9_j
 - [Intro to Robot Motion: Theory, Algorithms, and Implementations](https://reid.xz.ax/swbible) is way too long and in depth, but appendix J is a good primer on linear control.
 - [Purdue SigBots](https://wiki.purduesigbots.com/software/control-algorithms) has a nice wiki.
 - [WPIlib](https://docs.wpilib.org/en/stable/docs/software/advanced-controls/state-space/index.html) may be familiar to you and has a good controls primer.
+
+Run from the x64 Native Tools Command Prompt 
+code .
