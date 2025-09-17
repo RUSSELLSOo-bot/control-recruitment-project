@@ -93,7 +93,7 @@ class Simulator:
     
     class Polygon:
         
-        #vertices should be an (N, 2) array of points
+        #vertices should be an (N, 2) array of points, ORDERED LOCAITONALLY 
         def __init__(self, vertices: np.ndarray):
             self.cx = np.mean(vertices[:, 0])
             self.cy = np.mean(vertices[:, 1])
@@ -140,7 +140,7 @@ class Simulator:
                 
                 D = 2 * (x1*(y2 - y3) + x2*(y3 - y1) + x3*(y1 - y2))
                 
-                # Fix 2: Guard against collinear points (D == 0)
+                # fix for corner cases of determinant being zero
                 if D == 0:
                     return None
                 
@@ -161,7 +161,7 @@ class Simulator:
 
         def check_inside_circle(self, point):
             for i in self.circle:
-                if i is None:  # Handle collinear triangles
+                if i is None:  # handle collinear triangles
                     continue
                 x_c, y_c, r = i
                 x, y = point
@@ -281,6 +281,56 @@ class Simulator:
             return cleaned
         
         self.polygons = clean_triangulation(polygon_list,self.cones)
+
+    def order_cones(self, points):
+        points = points.copy()
+        ordered = [points[0]]
+        used = {0}  # Use set instead of list
+        for _ in range(len(points)-1):
+            last = ordered[-1]
+            # compute distances to unused points
+            distance = np.linalg.norm(points - last, axis=1)
+
+            #set distance of used poitns to infinity so they are not compared 
+            distance[list(used)] = np.inf
+
+            # least distance is new point
+            nearest_point = np.argmin(distance)
+            ordered.append(points[nearest_point])
+            used.add(nearest_point)
+        return np.array(ordered)
+
+    def create_midpoints(self):
+        midpoints = []
+
+        #create polygon for all left edges and right edges seperately 
+        left_edge = self.Polygon(self.order_cones(self.left_cones))
+        right_edge = self.Polygon(self.order_cones(self.right_cones))
+
+        # this assumes that we are always driving clockwise since the left edge barrier
+
+        for tri in self.polygons:
+            for edge in tri.edges:
+                p1, p2 = edge
+                
+                midpoint = (p1 + p2) / 2
+
+                #if inside the outer and not inside the inner barrier then it is within the track limits
+                if left_edge.check_inside_polygon(midpoint) and not right_edge.check_inside_polygon(midpoint):
+                    midpoints.append(midpoint)
+        
+        #filter the points that are too close to the left and right barriers
+        clean = []
+        min_dist = 2  # minimum distance from barriers
+
+        for m in midpoints:
+            d_left = np.min(np.linalg.norm(left_edge.points - m, axis=1))
+            d_right = np.min(np.linalg.norm(right_edge.points - m, axis=1))
+            # keep only if it's comfortably between both sides
+            if d_left > min_dist and d_right > min_dist:
+                clean.append(m)
+
+        return np.array(clean), left_edge, right_edge
 
 
         

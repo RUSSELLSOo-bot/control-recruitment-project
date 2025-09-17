@@ -59,16 +59,34 @@ def visualize_all_triangulated_polygons():
     if hasattr(sim, 'polygons') and sim.polygons:
         print(f"Plotting {len(sim.polygons)} triangulated polygons...")
         
+        # Create midpoints and get edge polygons
+        midpoints, left_edge, right_edge = sim.create_midpoints()
+        print(f"Created {len(midpoints)} midpoints...")
+        
         # Use the same color for all triangles
         triangle_color = 'lightblue'
         
         # for i, simplex in enumerate(Delaunay(sim.cones).simplices):
         #     plot_polygon(ax, sim.cones[simplex], color=triangle_color, alpha=0.1, 
         #                label='Triangles' if i == 0 else None, linewidth=1.5)
-            
+        
         for i, polygon in enumerate(sim.polygons):
             plot_polygon(ax, polygon.points, color=triangle_color, alpha=0.1, 
                        label='Triangles' if i == 0 else None, linewidth=1.5)
+
+        # # Plot edge polygons
+        # if left_edge and hasattr(left_edge, 'points'):
+        #     plot_polygon(ax, left_edge.points, color='blue', alpha=0.3, 
+        #                label='Left Edge Polygon', linewidth=2)
+        
+        # if right_edge and hasattr(right_edge, 'points'):
+        #     plot_polygon(ax, right_edge.points, color='orange', alpha=0.3, 
+        #                label='Right Edge Polygon', linewidth=2)
+        
+        # Plot midpoints
+        if len(midpoints) > 0:
+            ax.scatter(midpoints[:, 0], midpoints[:, 1], 
+                      color='purple', s=10, alpha=0.9, label='Midpoints', zorder=8, marker='o')
             
          
     else:
@@ -77,15 +95,20 @@ def visualize_all_triangulated_polygons():
     
     ax.set_aspect('equal')
     ax.grid(True, alpha=0.3)
+    # Set view constraints
+    ax.set_xlim(-50, 50)
+    ax.set_ylim(-30, 10)
+    
     ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     ax.set_xlabel('X Position (m)')
     ax.set_ylabel('Y Position (m)')
-    ax.set_title(f'All Triangulated Polygons ({len(sim.polygons)} triangles)')
+    ax.set_title(f'Triangulated Polygons with Edge Boundaries ({len(sim.polygons)} triangles)')
     
     # Add statistics
     stats_text = f"""
     Triangulation Results:
     • Total triangles: {len(sim.polygons)}
+    • Total midpoints: {len(midpoints)}
     • Total cones: {len(sim.cones)}
     • Triangles per cone: {len(sim.polygons)/len(sim.cones):.2f}
     """
