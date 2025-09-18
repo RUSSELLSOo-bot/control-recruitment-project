@@ -2,6 +2,10 @@ import casadi as ca
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import animation, patches, transforms
+from scipy.interpolate import splprep, splev
+from scipy.integrate import quad
+from scipy.optimize import minimize_scalar
+
 
 _centerline = ca.external(
     'centerline', 
@@ -91,6 +95,7 @@ class Simulator:
     def car_vertices(self):
         return self.car_outline
     
+    """RUSSELLLLLLLLLL CODEEEEEE"""
     class Polygon:
         
         #vertices should be an (N, 2) array of points, ORDERED LOCAITONALLY 
@@ -284,8 +289,13 @@ class Simulator:
 
     def order_cones(self, points):
         points = points.copy()
-        ordered = [points[0]]
-        used = {0}  # Use set instead of list
+        
+        # Find the point closest to car spawn position (0, 0)
+        distances_to_origin = np.linalg.norm(points, axis=1)
+        start_idx = np.argmin(distances_to_origin)
+        
+        ordered = [points[start_idx]]
+        used = {start_idx}  # Use set instead of list
         for _ in range(len(points)-1):
             last = ordered[-1]
             # compute distances to unused points
@@ -321,20 +331,70 @@ class Simulator:
         
         #filter the points that are too close to the left and right barriers
         clean = []
-        min_dist = 2  # minimum distance from barriers
+        tolerance = 1 # minimum distance tolerance to be inside the middle of the track
 
         for m in midpoints:
             d_left = np.min(np.linalg.norm(left_edge.points - m, axis=1))
             d_right = np.min(np.linalg.norm(right_edge.points - m, axis=1))
-            # keep only if it's comfortably between both sides
-            if d_left > min_dist and d_right > min_dist:
+            if abs(d_left - d_right) < tolerance:
                 clean.append(m)
 
-        return np.array(clean), left_edge, right_edge
+        #there are duplicate values of each midpoint because of the del triangulation
+        clean = np.unique(clean, axis=0)   
+        # Order the midpoints using the same method as cones, starting from closest to (0,0)
+        ordered_midpoints = self.order_cones(np.array(clean))
+        
+        # Reverse the order of midpoints to change direction
+        ordered_midpoints = ordered_midpoints[::-1]
 
+        return ordered_midpoints, left_edge, right_edge
+
+    def spline_path(self, midpoints):
+        
+        #interpolate midpoint
+        x = midpoints[:, 0]
+        y = midpoints[:, 1]
+
+        # create the spline object tck and the index u of path progress
+        # per=1 makes it periodic (closed loop) - connects end back to start
+        self.tck, self.u = splprep([x, y], s=0, per=1)
+
+        # Calculate arc length using numerical integration
+        u_samples = np.linspace(0, 1, 2000)
+        dx, dy = splev(u_samples, self.tck, der=1)
+        speed = np.sqrt(dx**2 + dy**2)
+        self.arc_length = np.trapz(speed, u_samples)
+
+    #umin and umax have to be in terms of the spline parameterization, 0 to 1
+    #be careful to remove the scalar projection using the arc length
+
+    def closest_point_on_spline(self,car_x, car_y ,tck, a , b):
+        """Find the closest point on the spline to the given car position.
+        
+        Args:
+            car_x (float): Car's x position
+            car_y (float): Car's y position
+            
+        Returns:
+            tuple: (u_value, distance_squared) where u_value is the parameter 
+                   value on the spline and distance_squared is the squared distance
+        """
+            
+        def dist_sq(u):
+            xr, yr = splev(u, tck)
+            return (xr - car_x)**2 + (yr - car_y)**2
+
+        res = minimize_scalar(dist_sq, bounds=(a, b), method='bounded')
+        return res.x, res.fun
+
+
+    
 
         
 
+
+    
+    """rUSSELL COOOOOOODEEE       ENDDDDDDDDDDDDDDDDDDDD"""
         
 
     def R(self, theta):
@@ -433,16 +493,39 @@ class Simulator:
             filename (str, optional): filename to save as, if `save` is True. Defaults to 'sim.gif'.
             block (bool, optional): the `block` argument to plt.show(). Defaults to True.
         """
+        # Create the spline path if it doesn't exist
+        if not hasattr(self, 'tck'):
+            self.del_triangulation()
+            midpoints, _, _ = self.create_midpoints()
+            self.spline_path(midpoints)
+        
         fig = plt.figure(figsize=(10, 12))
         axs = fig.subplots(2, 1, height_ratios=[4, 1])
         axs[0].set_aspect('equal')
         axs[1].set_aspect(1)
         axs[0].scatter(*self.left_cones.T, color='tab:blue')
         axs[0].scatter(*self.right_cones.T, color='tab:orange')
+        
+        # Plot the spline path
+        s_values = np.linspace(0, 1, 200)
+        spline_points = np.array([splev(s, self.tck) for s in s_values])
+        axs[0].plot(spline_points[:, 0], spline_points[:, 1], 'g-', 
+                   linewidth=2, alpha=0.7, label='Racing Line')
+        
         outline = axs[0].add_patch(patches.Polygon(self.car_outline, fill=True, closed=True, facecolor='lightblue', edgecolor='black'))
         posearrow = axs[0].add_patch(patches.FancyArrow(0, 0, 1, 0, width=0.1, color='tab:red'))
+        
+        # Add closest point marker
+        closest_point_marker = axs[0].scatter([], [], color='red', s=100, marker='o', zorder=10, label='Closest Point')
+        
+        # Add car position text
+        car_position_text = axs[0].text(0.02, 0.98, '', transform=axs[0].transAxes, 
+                                       fontsize=12, verticalalignment='top',
+                                       bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+        
         accel = axs[1].plot([0],[0])[0]
         axs[0].set_title('car pose')
+        axs[0].legend()
 
         axs[1].set_title('net acceleration')
         axs[1].set_xlabel('time (s)')
@@ -452,6 +535,7 @@ class Simulator:
         accel_values = np.array([self._get_accel(x, u) for x, u in zip(xs.T, us.T)])
         axs[1].hlines([12], [0], [np.max(ts)], linestyles='dashed', color='tab:red')
         collision_patches = []
+        
         def frame(i):
             outline_points = ((self.R(xs[2, i])@self.car_outline.T).T + xs[0:2, i])
             arrow_data = dict(
@@ -460,6 +544,19 @@ class Simulator:
                 dx=np.cos(xs[2, i]),
                 dy=np.sin(xs[2, i]),
             )
+            
+            # Find and update closest point on spline
+            car_x, car_y = xs[0, i], xs[1, i]
+            
+            # Update car position text
+            car_position_text.set_text(f'Car Position:\nX: {car_x:.2f} m\nY: {car_y:.2f} m\nHeading: {xs[2, i]:.2f} rad\nVelocity: {xs[3, i]:.2f} m/s\nSteering: {xs[4, i]:.2f} rad')
+            
+            # Calculate closest point for visualization
+            u_closest, _ = self.closest_point_on_spline(car_x, car_y, self.tck, 0.0, 1.0)
+            if u_closest is not None:
+                closest_x, closest_y = splev(u_closest, self.tck)
+                closest_point_marker.set_offsets([[closest_x, closest_y]])
+            
             if self._check_collision(xs[:, i]):
                 collision_car = patches.Polygon(outline_points, color='tab:red', fill=False, linewidth=0.1)
                 collision_pose = patches.FancyArrow(**arrow_data, width=0.1, color='black')
@@ -469,7 +566,7 @@ class Simulator:
             posearrow.set_data(**arrow_data)
             accel.set_xdata(ts[:i+1])
             accel.set_ydata(accel_values[:i+1])
-            return [accel, outline, posearrow] + collision_patches
+            return [accel, outline, posearrow, closest_point_marker, car_position_text] + collision_patches
 
         anim = animation.FuncAnimation(fig, frame, len(ts), interval=10)
         if save:

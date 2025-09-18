@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as MplPolygon
 from simulator import Simulator
 from scipy.spatial import Delaunay
+from scipy.interpolate import splev
 import matplotlib.animation as animation
 import time
 
@@ -40,6 +41,65 @@ def create_track_boundary(cones):
     
     return cones[boundary_indices]
 
+def visualize_midpoint_order():
+    """Debug visualization to show the order of midpoints"""
+    sim = Simulator()
+    
+    # Create triangulation and get midpoints
+    sim.del_triangulation()
+    midpoints, left_edge, right_edge = sim.create_midpoints()
+    
+    fig, ax = plt.subplots(1, 1, figsize=(15, 10))
+    ax.set_aspect('equal')
+    
+    # Plot track boundaries
+    ax.scatter(*sim.left_cones.T, color='tab:blue', label='Left Cones', alpha=0.6)
+    ax.scatter(*sim.right_cones.T, color='tab:orange', label='Right Cones', alpha=0.6)
+    
+    # Plot midpoints with numbered labels
+    ax.scatter(midpoints[:, 0], midpoints[:, 1], color='purple', s=50, label='Midpoints', zorder=5)
+    
+    # Add number labels to each midpoint
+    for i, (x, y) in enumerate(midpoints):
+        ax.annotate(f'{i+1}', (x, y), xytext=(5, 5), textcoords='offset points', 
+                   fontsize=8, color='black', weight='bold',
+                   bbox=dict(boxstyle='circle,pad=0.2', facecolor='white', alpha=0.8))
+    
+    # Draw lines connecting consecutive midpoints to show order
+    for i in range(len(midpoints) - 1):
+        ax.plot([midpoints[i, 0], midpoints[i+1, 0]], 
+                [midpoints[i, 1], midpoints[i+1, 1]], 
+                'r-', alpha=0.5, linewidth=1.5)
+    
+    # Connect last point to first to show if it's a closed loop
+    ax.plot([midpoints[-1, 0], midpoints[0, 0]], 
+            [midpoints[-1, 1], midpoints[0, 1]], 
+            'r--', alpha=0.5, linewidth=2, label='Loop closure')
+    
+    # Create and visualize the spline from simulator
+    sim.spline_path(midpoints)
+    
+    # Generate spline points for visualization
+    s_values = np.linspace(0, 1, 200)
+    spline_points = np.array([splev(s, sim.tck) for s in s_values])
+    
+    # Plot the spline
+    ax.plot(spline_points[:, 0], spline_points[:, 1], 'g-', 
+            linewidth=3, alpha=0.8, label='Spline Path', zorder=10)
+    
+    ax.set_title(f'Midpoint Order Visualization ({len(midpoints)} points)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_xlabel('X Position (m)')
+    ax.set_ylabel('Y Position (m)')
+    
+    # Set axis limits to match main visualization
+    ax.set_xlim(-20, 35)
+    ax.set_ylim(-35, 10)
+    
+    plt.tight_layout()
+    plt.show()
+
 def visualize_all_triangulated_polygons():
     """Visualize all triangulated polygons from the simulator."""
     sim = Simulator()
@@ -59,35 +119,28 @@ def visualize_all_triangulated_polygons():
     if hasattr(sim, 'polygons') and sim.polygons:
         print(f"Plotting {len(sim.polygons)} triangulated polygons...")
         
-        # Create midpoints and get edge polygons
-        midpoints, left_edge, right_edge = sim.create_midpoints()
-        print(f"Created {len(midpoints)} midpoints...")
-        
         # Use the same color for all triangles
         triangle_color = 'lightblue'
         
         # for i, simplex in enumerate(Delaunay(sim.cones).simplices):
         #     plot_polygon(ax, sim.cones[simplex], color=triangle_color, alpha=0.1, 
         #                label='Triangles' if i == 0 else None, linewidth=1.5)
-        
+            
         for i, polygon in enumerate(sim.polygons):
             plot_polygon(ax, polygon.points, color=triangle_color, alpha=0.1, 
                        label='Triangles' if i == 0 else None, linewidth=1.5)
-
-        # # Plot edge polygons
-        # if left_edge and hasattr(left_edge, 'points'):
-        #     plot_polygon(ax, left_edge.points, color='blue', alpha=0.3, 
-        #                label='Left Edge Polygon', linewidth=2)
-        
-        # if right_edge and hasattr(right_edge, 'points'):
-        #     plot_polygon(ax, right_edge.points, color='orange', alpha=0.3, 
-        #                label='Right Edge Polygon', linewidth=2)
-        
-        # Plot midpoints
-        if len(midpoints) > 0:
-            ax.scatter(midpoints[:, 0], midpoints[:, 1], 
-                      color='purple', s=10, alpha=0.9, label='Midpoints', zorder=8, marker='o')
             
+        # Plot midpoints
+        midpoints, left_edge, right_edge = sim.create_midpoints()
+        if midpoints.size > 0:
+            ax.scatter(midpoints[:, 0], midpoints[:, 1], color='purple', s=40, alpha=0.8, label='Midpoints', zorder=15)
+            
+            # Plot splined path
+            
+            # spline_points = sim.spline_path(midpoints)
+            
+            # ax.plot(spline_points[:, 0], spline_points[:, 1], color='green', linewidth=3, alpha=0.8, label='Splined Path', zorder=12)
+        
          
     else:
         print("No triangulated polygons found!")
@@ -95,20 +148,19 @@ def visualize_all_triangulated_polygons():
     
     ax.set_aspect('equal')
     ax.grid(True, alpha=0.3)
-    # Set view constraints
-    ax.set_xlim(-50, 50)
-    ax.set_ylim(-30, 10)
-    
     ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     ax.set_xlabel('X Position (m)')
     ax.set_ylabel('Y Position (m)')
-    ax.set_title(f'Triangulated Polygons with Edge Boundaries ({len(sim.polygons)} triangles)')
+    ax.set_title(f'All Triangulated Polygons ({len(sim.polygons)} triangles)')
+    
+    # Set axis limits
+    ax.set_xlim(-20, 35)
+    ax.set_ylim(-35, 10)
     
     # Add statistics
     stats_text = f"""
     Triangulation Results:
     • Total triangles: {len(sim.polygons)}
-    • Total midpoints: {len(midpoints)}
     • Total cones: {len(sim.cones)}
     • Triangles per cone: {len(sim.polygons)/len(sim.cones):.2f}
     """
@@ -121,8 +173,8 @@ def visualize_all_triangulated_polygons():
 
 
 if __name__ == "__main__":
-  
+    
+    visualize_midpoint_order()
     visualize_all_triangulated_polygons()
-    
-    
-  
+   
+
