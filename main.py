@@ -82,8 +82,7 @@ def controller(x):
     """
     global sim, current_path_s, current_path_point, recorded_path_s, recorded_timestamps, past_s, ARC_LEN, CAR_SHAPE, recorded_car_x, recorded_car_y
     
-    # Record current time for plotting (approximate simulation time)
-    current_time = len(recorded_timestamps) * 0.01  # 0.01 second timesteps
+    
     
     # Constants are automatically accessible (defined outside function)
     # WHEELBASE, WHEEL_ANG_MAX, PATH_CHECK_FOW, etc. can be used directly
@@ -99,7 +98,7 @@ def controller(x):
     # a = past_s - PATH_CHECK_BACK/ARC_LEN
     a = past_s - PATH_CHECK_BACK/ARC_LEN
     b = past_s + PATH_CHECK_FOW/ARC_LEN 
-    # # current_path_s, lat_dev = sim.closest_point_on_spline( a, b)
+
 
     if a < 0:
         # split into [0, b] and [1+a, 1]
@@ -115,13 +114,27 @@ def controller(x):
         # normal case
         current_path_s, lat_dev = sim.closest_point_on_spline(x, y, sim.tck, a, b)
 
-    # #current_path_s = current_path_s % 1.0
-
-    # current_path_s, lat_dev = sim.closest_point_on_spline(x, y, sim.tck, 0.0, 1.0)
-
     xr, yr, dx, dy, ddx, ddy = get_path_info(sim, current_path_s)
     current_path_point = [xr, yr]
-    past_s = current_path_s
+    
+
+    current_curvature = (dx * ddy - dy * ddx) / (dx**2 + dy**2)**1.5
+
+    """Now we want to make a velocity controller separate based on the total curvature of the path"""
+    # this is an absolute constraint
+    v_corner = np.min([np.sqrt(MAX_TOTAL_ACCEL / abs(current_curvature)), 20])
+
+    #this is a constraint with a foward sweep, from starting to finish what is feasible for our car per point to accerlate to 
+    a_accel_feasible = np.min([MAX_TOTAL_ACCEL, current_curvature*velocity**2])
+    a_accel_max = np.abs(WHEEL_ACCEL_MIN) * np.sqrt(1 - (a_accel_feasible/MAX_TOTAL_ACCEL)**2)
+    v_accel = np.sqrt(velocity**2 + 2*a_accel_max((current_path_s - past_s)*ARC_LEN))
+
+    # this is a constraint with a backward sweep, from finish to start what is feasible for our car to decelerate to
+    a_decel_feasible = np.min(MAX_TOTAL_ACCEL, current_curvature*velocity**2)
+    a_brake_max = np.abs(WHEEL_ACCEL_MIN) * np.sqrt(1 - (a_decel_feasible/MAX_TOTAL_ACCEL)**2 )
+    v_decel = np.sqrt(velocity**2 + 2*a_brake_max((past_s - current_path_s)*ARC_LEN))
+
+    v_desired = np.min([v_corner, v_accel, v_decel])
 
 
 
@@ -131,18 +144,21 @@ def controller(x):
     steering_rate = np.clip(0, STEERING_RATE_MIN, STEERING_RATE_MAX)
     
     # Record current path_s value, car position, and timestamp for plotting
-    recorded_path_s.append(current_path_s)
-    recorded_car_x.append(x)
-    recorded_car_y.append(y)
-    recorded_timestamps.append(time.time() - start_time)
-
+    # Record current time for plotting (approximate simulation time)
+    #current_time = len(recorded_timestamps) * 0.01  # 0.01 second timesteps
+    # recorded_path_s.append(current_path_s)
+    # recorded_car_x.append(x)
+    # recorded_car_y.append(y)
+    # recorded_timestamps.append(time.time() - start_time)
+    past_s = current_path_s
+    
     return np.array([acceleration, steering_rate])
 
 
-sim.set_controller(controller)
-sim.run()
-sim.animate()
-sim.plot()
+# sim.set_controller(controller)
+# sim.run()
+# sim.animate()
+# sim.plot()
 
 def plot_path_s_and_position_over_time():
     """Plot the recorded path_s values and car position as a function of time."""
@@ -218,6 +234,82 @@ def plot_path_s_and_position_over_time():
     plt.tight_layout()
     plt.show()
 
+def compute_and_plot_velocity_profiles(sim, num_points=10000):
+    # Discretize spline
+    s_vals = np.linspace(0, 1, num_points)
+    arc_len = sim.arc_length
+    ds = arc_len / (num_points - 1)
+    
+    # Create arc length array for plotting (in meters)
+    arc_length_positions = s_vals * arc_len
+
+    # Arrays
+    v_corner = np.zeros(num_points)
+    v_accel  = np.zeros(num_points)
+    v_brake  = np.zeros(num_points)
+    v_desired  = np.zeros(num_points)
+
+    #cornering limit case, find the max velocity at all discretized points on the path that satisfy the cornering acceraltion constraint
+    for i, s in enumerate(s_vals):
+        _, _, dx, dy, ddx, ddy = get_path_info(sim, s)
+        curvature = (dx*ddy - dy*ddx) / (dx**2 + dy**2)**1.5
+
+        #edge case doesnt matter it will pick the smallest value anyway
+        v_corner[i] = np.sqrt(MAX_TOTAL_ACCEL / abs(curvature))
+
+    #forward sweep, having foresight to see maximum acceration feasible from the start, still constrained by teh cornering limit
+    v_accel[0] = 0.0
+    for i in range(num_points-1):
+        v_accel[i+1] = min(
+            np.sqrt(v_accel[i]**2 + 2*WHEEL_ACCEL_MAX*ds),
+            v_corner[i+1]
+        )
+
+    #backward sweep, having hindsight to see maximum decceleration feasible from the end, still constrained by the cornering limit
+    v_brake[-1] = 0.0
+    for i in range(num_points-2, -1, -1):
+        v_brake[i] = min(
+            np.sqrt(v_brake[i+1]**2 + 2*abs(WHEEL_ACCEL_MIN)*ds),
+            v_corner[i]
+        )
+
+    # --- Final profile: min of all three ---
+    for i in range(num_points):
+        v_desired[i] = min(v_corner[i], v_accel[i], v_brake[i])
+
+    # --- Plot with arc length instead of point indices ---
+    plt.figure(figsize=(12,6))
+    plt.plot(arc_length_positions, v_brake, 'r-', label="Braking Limit", linewidth=2, alpha=0.8)
+    plt.plot(arc_length_positions, v_accel, 'y-', label="Accelerating Limit", linewidth=2, alpha=0.8)
+    plt.plot(arc_length_positions, v_desired, 'b-', label="Final Velocity Profile", linewidth=3)
+    plt.xlabel("Arc Length [m]")
+    plt.ylabel("Velocity [m/s]")
+    plt.title(f"Velocity Profile vs Arc Length (Total track length: {arc_len:.2f} m)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Add some statistics
+    max_velocity = np.max(v_desired)
+    avg_velocity = np.mean(v_desired)
+    min_velocity = np.min(v_desired[v_desired > 0])  # Exclude zero velocities
+
+    stats_text = f"""
+    Statistics:
+    • Max velocity: {max_velocity:.2f} m/s
+    • Avg velocity: {avg_velocity:.2f} m/s
+    • Min velocity: {min_velocity:.2f} m/s
+    • Track length: {arc_len:.2f} m
+    """
+    
+    plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes, 
+            verticalalignment='top', fontsize=10,
+            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+    
+    plt.show()
+
+    return s_vals, v_corner, v_accel, v_brake, v_desired, arc_length_positions
+
+compute_and_plot_velocity_profiles(sim)
 # Plot the recorded path_s values and car position
-plot_path_s_and_position_over_time()
+#plot_path_s_and_position_over_time()
 
