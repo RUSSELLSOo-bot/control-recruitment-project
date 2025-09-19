@@ -1,4 +1,6 @@
+import time
 import numpy as np
+import matplotlib.pyplot as plt
 from simulator import Simulator, centerline
 from scipy.interpolate import splprep, splev
 from scipy.optimize import minimize_scalar
@@ -30,9 +32,18 @@ PATH_CHECK_BACK = 0.2  # m - backward check distance
 # Global variable to track current path position for visualization
 current_path_s = 0.0
 current_path_point = [0.0, 0.0]
+past_s = 0.0
 
-arc_len = sim.arc_length
-car_shape = sim.car_vertices
+# Lists to record path_s values over time for plotting
+recorded_path_s = []
+recorded_timestamps = []
+
+# Lists to record car position over time for plotting
+recorded_car_x = []
+recorded_car_y = []
+
+ARC_LEN = sim.arc_length
+CAR_SHAPE = sim.car_vertices
 
 def get_path_info(sim, s):
     xr, yr = splev(s, sim.tck)
@@ -46,7 +57,7 @@ def get_path_info(sim, s):
     return xr, yr, dx, dy, ddx, ddy
 
 
-
+start_time = time.time()
 
 
 def controller(x):
@@ -69,49 +80,49 @@ def controller(x):
         the maximum acceleration the car can handle (in x and y combined) is 12 meters per second per second.
         
     """
-    global sim, current_path_s, current_path_point
+    global sim, current_path_s, current_path_point, recorded_path_s, recorded_timestamps, past_s, ARC_LEN, CAR_SHAPE, recorded_car_x, recorded_car_y
+    
+    # Record current time for plotting (approximate simulation time)
+    current_time = len(recorded_timestamps) * 0.01  # 0.01 second timesteps
     
     # Constants are automatically accessible (defined outside function)
     # WHEELBASE, WHEEL_ANG_MAX, PATH_CHECK_FOW, etc. can be used directly
     
     # EXTRACT STATE VARIABLES
     [x, y, heading, velocity, steering_angle] = x
-    past_s = current_path_s
-    #when the code is starting up, we want to initialize the pastxr and pastyr variables
-    if x == 0 and y == 0:
-        current_path_s = 0  # Start at beginning of path
-        xr, yr, dx, dy, ddx, ddy = get_path_info(sim, current_path_s)
-        current_path_point = [xr, yr]
-        past_s = current_path_s
-        
+    
+
         
     #this should be used for everything else but the first iteration
+
+    # Find closest point on path
+    # a = past_s - PATH_CHECK_BACK/ARC_LEN
+    a = past_s - PATH_CHECK_BACK/ARC_LEN
+    b = past_s + PATH_CHECK_FOW/ARC_LEN 
+    # # current_path_s, lat_dev = sim.closest_point_on_spline( a, b)
+
+    if a < 0:
+        # split into [0, b] and [1+a, 1]
+        u1, dist1 = sim.closest_point_on_spline(x, y, sim.tck, 0.0, b)
+        u2, dist2 = sim.closest_point_on_spline(x, y, sim.tck, 1.0+a, 1.0)
+        current_path_s = u1 if dist1 < dist2 else u2
+    elif b > 1:
+        # split into [a, 1] and [0, b-1]
+        u1, dist1 = sim.closest_point_on_spline(x, y, sim.tck, a, 1.0)
+        u2, dist2 = sim.closest_point_on_spline(x, y, sim.tck, 0.0, b-1.0)
+        current_path_s = u1 if dist1 < dist2 else u2
     else:
-        # Find closest point on path
-        a = (past_s - PATH_CHECK_BACK)/arc_len
-        b = ((past_s + PATH_CHECK_FOW)/arc_len ) % 1
-        # current_path_s, lat_dev = sim.closest_point_on_spline( a, b)
+        # normal case
+        current_path_s, lat_dev = sim.closest_point_on_spline(x, y, sim.tck, a, b)
 
-        if a < 0:
-            # split into [0, b] and [1+a, 1]
-            u1, dist1 = sim.closest_point_on_spline(x, y, sim.tck, 0.0, b)
-            u2, dist2 = sim.closest_point_on_spline(x, y, sim.tck, 1.0+a, 1.0)
-            current_path_s = u1 if dist1 < dist2 else u2
-        elif b > 1:
-            # split into [a, 1] and [0, b-1]
-            u1, dist1 = sim.closest_point_on_spline(x, y, sim.tck, a, 1.0)
-            u2, dist2 = sim.closest_point_on_spline(x, y, sim.tck, 0.0, b-1.0)
-            current_path_s = u1 if dist1 < dist2 else u2
-        else:
-            # normal case
-            current_path_s, lat_dev = sim.closest_point_on_spline(x, y, sim.tck, a, b)
+    # #current_path_s = current_path_s % 1.0
 
-        current_path_s = current_path_s % 1.0
+    # current_path_s, lat_dev = sim.closest_point_on_spline(x, y, sim.tck, 0.0, 1.0)
 
-        xr, yr, dx, dy, ddx, ddy = get_path_info(sim, current_path_s)
-        current_path_point = [xr, yr]
-        past_s = current_path_s
-    
+    xr, yr, dx, dy, ddx, ddy = get_path_info(sim, current_path_s)
+    current_path_point = [xr, yr]
+    past_s = current_path_s
+
 
 
     # COMPUTE LATERAL DEVIATION
@@ -119,10 +130,11 @@ def controller(x):
     acceleration = np.clip(10, WHEEL_ACCEL_MIN, WHEEL_ACCEL_MAX)
     steering_rate = np.clip(0, STEERING_RATE_MIN, STEERING_RATE_MAX)
     
-
-
-
-
+    # Record current path_s value, car position, and timestamp for plotting
+    recorded_path_s.append(current_path_s)
+    recorded_car_x.append(x)
+    recorded_car_y.append(y)
+    recorded_timestamps.append(time.time() - start_time)
 
     return np.array([acceleration, steering_rate])
 
@@ -132,5 +144,80 @@ sim.run()
 sim.animate()
 sim.plot()
 
-# Uncomment the line below to test the closest point visualization
-#test_closest_point_visualization()
+def plot_path_s_and_position_over_time():
+    """Plot the recorded path_s values and car position as a function of time."""
+    
+    if len(recorded_path_s) == 0:
+        print("No data recorded!")
+        return
+    
+    # Create the plot with 3 subplots
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    
+    # Plot 1: s values (0-1) as function of time
+    ax1.plot(recorded_timestamps, recorded_path_s, 'b-', linewidth=2, alpha=0.8)
+    ax1.set_ylabel('Path Parameter s (0-1)')
+    ax1.set_title('Path Parameter s Over Time')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_ylim(0, 1)
+    
+    # Plot 2: Car X position over time
+    ax2.plot(recorded_timestamps, recorded_car_x, 'r-', linewidth=2, alpha=0.8)
+    ax2.set_ylabel('Car X Position (m)')
+    ax2.set_title('Car X Position Over Time')
+    ax2.grid(True, alpha=0.3)
+
+
+    # Plot 3: Car Y position over time
+    ax3.plot(recorded_timestamps, recorded_car_y, 'g-', linewidth=2, alpha=0.8)
+    ax3.set_ylabel('Car Y Position (m)')
+    ax3.set_xlabel('Time (seconds)')
+    ax3.set_title('Car Y Position Over Time')
+    ax3.grid(True, alpha=0.3)
+    
+    # Add some statistics
+    if len(recorded_timestamps) > 0 and len(recorded_path_s) > 0:
+        total_time = recorded_timestamps[-1]
+        final_s = recorded_path_s[-1]
+        initial_s = recorded_path_s[0]
+        s_progress = final_s - initial_s
+        
+        # Handle wrap-around case (if s goes from near 1 back to near 0)
+        if s_progress < -0.5:  # Wrapped around
+            s_progress += 1.0
+        
+        avg_s_rate = s_progress / total_time if total_time > 0 else 0
+        
+        # Calculate distance traveled
+        total_distance = 0
+        if len(recorded_car_x) > 1:
+            for i in range(1, len(recorded_car_x)):
+                dx = recorded_car_x[i] - recorded_car_x[i-1]
+                dy = recorded_car_y[i] - recorded_car_y[i-1]
+                total_distance += np.sqrt(dx**2 + dy**2)
+        
+        avg_speed = total_distance / total_time if total_time > 0 else 0
+        
+        stats_text = f"""
+        Statistics:
+        • Total simulation time: {total_time:.2f} s
+        • Initial s value: {initial_s:.3f}
+        • Final s value: {final_s:.3f}
+        • s progress: {s_progress:.3f}
+        • Average s rate: {avg_s_rate:.3f} s⁻¹
+        • Laps completed: {s_progress:.2f}
+        • Distance traveled: {total_distance:.2f} m
+        • Average speed: {avg_speed:.2f} m/s
+        • Final position: ({recorded_car_x[-1]:.2f}, {recorded_car_y[-1]:.2f}) m
+        """
+        
+        ax1.text(0.02, 0.98, stats_text, transform=ax1.transAxes, 
+                verticalalignment='top', fontsize=10,
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
+    plt.tight_layout()
+    plt.show()
+
+# Plot the recorded path_s values and car position
+plot_path_s_and_position_over_time()
+
