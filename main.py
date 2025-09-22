@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from simulator import Simulator, centerline
 from scipy.interpolate import splprep, splev
 from scipy.optimize import minimize_scalar
+import casadi as ca
 
 sim = Simulator()
 #create triangulation and midpoints
@@ -46,6 +47,10 @@ recorded_car_y = []
 recorded_velocity = []
 recorded_acceleration_commands = []
 recorded_reference_velocity = []
+
+# Lists to record MPC states for plotting
+recorded_heading_error = []
+recorded_lateral_error = []
 
 ARC_LEN = sim.arc_length
 CAR_SHAPE = sim.car_vertices
@@ -110,6 +115,12 @@ def compute_velocity_profiles(sim, num_points=10000 , initial_velocity=0.0):
 
 #create velocity profile for entire track
 velocity_profiles = compute_velocity_profiles(sim)
+
+# MPC throttling parameters
+MPC_UPDATE_PERIOD = 0.05  # run MPC every 50 ms (20 Hz)
+mpc_timer = 0.0          # elapsed sim time since last MPC solve
+last_mpc_rate = 0.0      # last steering rate chosen by MPC
+
 #PID
 v_integral_error = 0.0
 v_previous_error = 0.0
@@ -119,10 +130,10 @@ v_Kp = 20.0
 v_Ki = 0.35
 v_Kd = 0.001
 
-# pid for lat control
-lat_integral_error = 0.0
-lat_previous_error = 0.0
-lat_Kp, lat_Ki, lat_Kd = 0.5, 0.0, 0.5  # <-- tune these
+# # pid for lat control
+# lat_integral_error = 0.0
+# lat_previous_error = 0.0
+# lat_Kp, lat_Ki, lat_Kd = 0.5, 0.0, 0.5  # <-- tune these
 
 dt = 0.01  # seconds per simulation step
 
@@ -131,6 +142,133 @@ dt = 0.01  # seconds per simulation step
 
 start_time = time.time()
 
+
+#build mpc for lateral control 
+"""optimization variables : ey = lateral deviation from path, psi = heading error 
+
+                           using theta = steering angle, d_theta = steering rate"""
+
+def build_lateral_mpc (N=100, dt=0.01, L=WHEELBASE,
+                      theta_min=WHEEL_ANG_MIN, theta_max=WHEEL_ANG_MAX,
+                      dtheta_min=STEERING_RATE_MIN, dtheta_max=STEERING_RATE_MAX, use_slip=True):
+
+    #3 state variables 1 control input
+    nx, nu = 3, 1  # [e_y, e_psi, theta], [d_theta]
+
+    #predict state and control over N timesteps, state at next timestep and u at current timestep
+    X = ca.SX.sym('X', nx, N+1)
+    U = ca.SX.sym('U', nu, N)
+
+    #initial state, velocity over the horizon, path curvature over the horizon
+    x0   = ca.SX.sym('x0', nx)
+    vseq = ca.SX.sym('v',  N)
+    kap  = ca.SX.sym('kap',N)
+
+    # cost weights (tune later)
+    w_ey, w_psi, w_theta = 2.0, 9.0, 0.01
+
+    J = 0
+    g = []; lbg = []; ubg = []
+
+    # initial condition
+    g += [X[:,0] - x0]; lbg += [0,0,0]; ubg += [0,0,0]
+
+    for k in range(N):
+        ey, psi, theta = X[0,k], X[1,k], X[2,k]
+        dtheta = U[0,k]
+        v_k= vseq[k]
+        kap_k  = kap[k]
+
+        v_safe = ca.fmax(v_k, 1e-3)
+        w = (v_safe/L) * ca.tan(theta)
+        B = ca.atan((L/2)/L * ca.tan(theta)) - (L/2)/v_safe * w
+
+        vx_k = v_safe * ca.cos(B)
+        vy_k = v_safe * ca.sin(B)
+
+        denom = 1 - ey * kap_k
+        denom_safe = ca.if_else(ca.fabs(denom) < 1e-3, 1e-3, denom)
+        s_dot = (vx_k * ca.cos(psi) - vy_k * ca.sin(psi)) / denom_safe
+
+
+
+        ey_N = ey + dt  * (vy_k * ca.cos(psi) + vx_k * ca.sin(psi))
+        psi_N = psi + dt * (w - s_dot * kap_k)
+        theta_N = theta + dt * dtheta
+
+
+        #constraint 
+        g += [X[:,k+1] - ca.vertcat(ey_N, psi_N, theta_N)]
+        lbg += [0, 0, 0]
+        ubg += [0, 0, 0]
+
+        #stage cost 
+        J += w_ey*ey**2 + w_psi*psi**2 + w_theta*theta**2 
+
+    #terminal cost
+    eyN, psiN, thetaN = X[0,N], X[1,N], X[2,N]
+    J += w_ey*eyN*eyN + w_psi*psiN*psiN + w_theta*thetaN*thetaN
+
+ 
+    opt_vars = ca.vertcat(ca.reshape(X, -1, 1), ca.reshape(U, -1, 1))
+
+    #hard constraints
+    lbx = []; ubx = []
+    # States bounds: only theta is bounded; (ey, epsi) unbounded here
+    for k in range(N+1):
+        lbx += [-ca.inf, -ca.inf, theta_min]
+        ubx += [ ca.inf,  ca.inf, theta_max]
+    #dtheta bounds
+    for k in range(N):
+        lbx += [dtheta_min]
+        ubx += [dtheta_max]
+
+    # Pack constraints and parameters
+    g_all = ca.vertcat(*g)
+    p_all = ca.vertcat(x0, vseq, kap)
+
+    # Build solver
+    nlp = {'x': opt_vars, 'f': J, 'g': g_all, 'p': p_all}
+    solver = ca.nlpsol(
+        'mpc_lat', 'ipopt', nlp,
+        {
+            'ipopt.print_level': 0,
+            'print_time': 0,
+            'ipopt.max_iter': 100,
+            'ipopt.sb': 'yes'
+        }
+    )
+
+    # Helpers for runtime use
+    nxTot = nx*(N+1); nuTot = nu*N
+
+    def pack_params(x0_val, vseq_val, kap_val):
+        """
+        x0_val: shape (3,), [ey, epsi, theta]
+        vseq_val: shape (N,)
+        kap_val:  shape (N,)
+        """
+        return np.concatenate([np.asarray(x0_val).ravel(),
+                               np.asarray(vseq_val).ravel(),
+                               np.asarray(kap_val).ravel()]).reshape(-1,1)
+
+    def unpack_solution(sol):
+        w = np.array(sol['x']).reshape(-1)
+        X_opt = w[:nxTot].reshape(nx, N+1)
+        U_opt = w[nxTot:].reshape(nu, N)
+        return X_opt, U_opt
+
+    meta = {
+        'nx': nx, 'nu': nu, 'N': N, 'dt': dt,
+        'nxTot': nxTot, 'nuTot': nuTot,
+        'var_shape': (nx, N+1, nu, N),
+        'use_slip': use_slip
+    }
+
+    return solver, lbx, ubx, lbg, ubg, pack_params, unpack_solution, meta
+
+#build mpc 
+mpc_solver, lbx, ubx, lbg, ubg, pack_params, unpack_solution, mpc_meta = build_lateral_mpc()
 
 def controller(x):
     """controller for a car
@@ -152,12 +290,13 @@ def controller(x):
         the maximum acceleration the car can handle (in x and y combined) is 12 meters per second per second.
         
     """
-    global sim, current_path_s, current_path_point, recorded_path_s, recorded_timestamps, past_s, ARC_LEN, CAR_SHAPE, recorded_car_x, recorded_car_y, velocity_profiles, recorded_velocity, recorded_acceleration_commands, recorded_reference_velocity
+    global sim, current_path_s, current_path_point, recorded_path_s, recorded_timestamps, past_s, ARC_LEN, CAR_SHAPE, recorded_car_x, recorded_car_y, velocity_profiles, recorded_velocity, recorded_acceleration_commands, recorded_reference_velocity, recorded_heading_error, recorded_lateral_error, mpc_timer, last_mpc_rate
     
 
     
     # EXTRACT STATE VARIABLES
     [x, y, heading, velocity, steering_angle] = x
+    #[x, y, absolute heading (rad from positive x axis counterclockwise), velocity (m/s), steering angle (rad from car centerline)]
     
 
         
@@ -239,20 +378,68 @@ def controller(x):
     #create feasible acceleration command 
     accel_control = np.clip(v_Kp * v_error +    v_Ki * v_integral_error +   v_Kd * v_derivative_error, WHEEL_ACCEL_MIN, WHEEL_ACCEL_MAX)
     
-
-    global lat_integral_error, lat_previous_error, lat_Kp, lat_Ki, lat_Kd
-
-    lat_error = -lat_dev
-    lat_integral_error += lat_error * dt
-    lat_derivative_error = (lat_error - lat_previous_error) / dt
-    lat_previous_error = lat_error
-
-    steering_rate = np.clip(
-        lat_Kp*lat_error + lat_Ki*lat_integral_error + lat_Kd*lat_derivative_error,
-        STEERING_RATE_MIN, STEERING_RATE_MAX
-    )
-
+    # Calculate MPC state variables for recording (always compute these)
+    e_y   = lat_dev
+    epsi = (heading - current_path_heading + np.pi) % (2*np.pi) - np.pi   # vehicle heading - path heading
     
+    # always compute velocity PID (cheap)
+    # only run MPC every MPC_UPDATE_PERIOD
+    mpc_timer += dt
+    
+    if mpc_timer >= MPC_UPDATE_PERIOD:
+        mpc_timer = 0.0  # reset timer
+        
+        # --- build and solve MPC as you currently do ---
+        theta = steering_angle
+        x0 = [e_y, epsi, theta]
+
+        # Build horizon preview
+        N = mpc_meta['N']
+
+        # s_preview = [ (current_path_s + i*ds) % 1.0 for i in range(N) ]
+        s_val = current_path_s
+        kap  = []
+        vseq = []
+
+        for index in range(N): 
+            #for each run, we have to find the reference velocity, append the velocity to the vseq array, and predict the next s value given
+            # that velocity by projecting it accross dt seconds 
+            vref = velocity_profiles[4][s_index]
+            vseq.append(vref) 
+
+            #use the s_val to follow indexing req for the velocity and apply to cuvature to the values are aligned
+            _, _, dx, dy, ddx, ddy = get_path_info(sim, s_val)
+            kap.append((dx*ddy - dy*ddx) / (dx**2 + dy**2)**1.5)
+        
+            # 0-1 
+            ds = (vref * dt) / ARC_LEN
+
+            
+            s_val = (s_val + ds) % 1.0
+
+            s_index = int(s_val * (len(velocity_profiles[4]) - 1))
+    
+
+        # Pack parameters and solve
+        p = pack_params(x0, vseq, kap)
+        sol = mpc_solver(lbx=lbx, ubx=ubx, lbg=lbg, ubg=ubg, p=p)
+
+        X_opt, U_opt = unpack_solution(sol)
+        last_mpc_rate = float(U_opt[0,0])   # take first control input
+    
+    # return last known steering rate + current accel
+    steering_rate = last_mpc_rate
+
+
+
+
+
+
+
+
+
+
+
     # Record current path_s value, car position, velocity, acceleration, and timestamp for plotting
     recorded_path_s.append(current_path_s)
     recorded_car_x.append(x)
@@ -260,10 +447,11 @@ def controller(x):
     recorded_velocity.append(velocity)
     recorded_acceleration_commands.append(accel_control)
     recorded_reference_velocity.append(v_reference)
+    recorded_heading_error.append(epsi)
+    recorded_lateral_error.append(e_y)
     # Use simulation time (0.01 second timesteps) instead of wall-clock time
     recorded_timestamps.append(len(recorded_timestamps) * 0.01)
     past_s = current_path_s
-    
 
 
 
@@ -349,8 +537,8 @@ def plot_path_s_and_position_over_time():
     plt.tight_layout()
     plt.show()
 
-def plot_velocity_and_acceleration_analysis():
-    """Plot acceleration commands, velocity profiles, and recorded velocity over time."""
+def plot_velocity_and_mpc_analysis():
+    """Plot velocity tracking, heading error, and lateral error over time."""
     
     if len(recorded_timestamps) == 0:
         print("No data recorded!")
@@ -367,44 +555,38 @@ def plot_velocity_and_acceleration_analysis():
     ax1.grid(True, alpha=0.3)
     ax1.legend()
     
-    # Plot 2: Acceleration commands
-    ax2.plot(recorded_timestamps, recorded_acceleration_commands, 'g-', linewidth=2, alpha=0.8)
-    ax2.axhline(y=WHEEL_ACCEL_MAX, color='r', linestyle=':', alpha=0.7, label=f'Max Accel ({WHEEL_ACCEL_MAX} m/s²)')
-    ax2.axhline(y=WHEEL_ACCEL_MIN, color='r', linestyle=':', alpha=0.7, label=f'Min Accel ({WHEEL_ACCEL_MIN} m/s²)')
-    ax2.set_ylabel('Acceleration Command (m/s²)')
-    ax2.set_title('Acceleration Commands Over Time')
+    # Plot 2: Heading error over time
+    ax2.plot(recorded_timestamps, recorded_heading_error, 'r-', linewidth=2, alpha=0.8)
+    ax2.axhline(y=0, color='black', linestyle='-', alpha=0.5)
+    ax2.set_ylabel('Heading Error (rad)')
+    ax2.set_title('Heading Error Over Time (Vehicle - Path)')
     ax2.grid(True, alpha=0.3)
-    ax2.legend()
     
-    # Plot 3: Velocity error
-    velocity_error = [ref - actual for ref, actual in zip(recorded_reference_velocity, recorded_velocity)]
-    ax3.plot(recorded_timestamps, velocity_error, 'purple', linewidth=2, alpha=0.8)
+    # Plot 3: Lateral error over time
+    ax3.plot(recorded_timestamps, recorded_lateral_error, 'orange', linewidth=2, alpha=0.8)
     ax3.axhline(y=0, color='black', linestyle='-', alpha=0.5)
-    ax3.set_ylabel('Velocity Error (m/s)')
+    ax3.set_ylabel('Lateral Error (m)')
     ax3.set_xlabel('Time (seconds)')
-    ax3.set_title('Velocity Tracking Error (Reference - Actual)')
+    ax3.set_title('Lateral Error Over Time (Distance from Path)')
     ax3.grid(True, alpha=0.3)
     
     # Add some statistics
     if len(recorded_velocity) > 0:
         avg_velocity = np.mean(recorded_velocity)
         max_velocity = np.max(recorded_velocity)
-        avg_accel = np.mean(recorded_acceleration_commands)
-        max_accel = np.max(recorded_acceleration_commands)
-        min_accel = np.min(recorded_acceleration_commands)
         
-        # Calculate RMS velocity error
-        rms_velocity_error = np.sqrt(np.mean([e**2 for e in velocity_error]))
+        # Calculate RMS errors
+        rms_heading_error = np.sqrt(np.mean([e**2 for e in recorded_heading_error]))
+        rms_lateral_error = np.sqrt(np.mean([e**2 for e in recorded_lateral_error]))
         
         stats_text = f"""
         Performance Statistics:
         • Avg velocity: {avg_velocity:.2f} m/s
         • Max velocity: {max_velocity:.2f} m/s
-        • Avg acceleration: {avg_accel:.2f} m/s²
-        • Max acceleration: {max_accel:.2f} m/s²
-        • Min acceleration: {min_accel:.2f} m/s²
-        • RMS velocity error: {rms_velocity_error:.3f} m/s
-        • Final velocity error: {velocity_error[-1]:.3f} m/s
+        • RMS heading error: {rms_heading_error:.3f} rad
+        • RMS lateral error: {rms_lateral_error:.3f} m
+        • Final heading error: {recorded_heading_error[-1]:.3f} rad
+        • Final lateral error: {recorded_lateral_error[-1]:.3f} m
         """
         
         ax1.text(0.02, 0.98, stats_text, transform=ax1.transAxes, 
@@ -493,8 +675,8 @@ def plot_vel_profiles(velocity_profiles):
 
 # plot_vel_profiles(velocity_profiles)
 
-# Plot analysis of velocity and acceleration performance
-plot_velocity_and_acceleration_analysis()
+# Plot analysis of velocity and MPC performance
+plot_velocity_and_mpc_analysis()
 plot_velocity_vs_position()
 
 

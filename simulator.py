@@ -513,10 +513,10 @@ class Simulator:
                    linewidth=2, alpha=0.7, label='Racing Line')
         
         outline = axs[0].add_patch(patches.Polygon(self.car_outline, fill=True, closed=True, facecolor='lightblue', edgecolor='black'))
-        posearrow = axs[0].add_patch(patches.FancyArrow(0, 0, 1, 0, width=0.1, color='tab:red'))
+        posearrow = axs[0].add_patch(patches.FancyArrow(0, 0, 3, 0, width=0.05, color='tab:red'))
         
         # Add closest point marker
-        closest_point_marker = axs[0].scatter([], [], color='red', s=100, marker='o', zorder=10, label='Closest Point')
+        closest_point_marker = axs[0].scatter([], [], color='red', s=25, marker='o', zorder=10, label='Closest Point')
         
         # Add car position text
         car_position_text = axs[0].text(0.02, 0.98, '', transform=axs[0].transAxes, 
