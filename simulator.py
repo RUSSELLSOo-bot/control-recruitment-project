@@ -382,7 +382,7 @@ class Simulator:
             
         def dist_sq(u):
             xr, yr = splev(u, tck)
-            return (xr - car_x)**2 + (yr - car_y)**2
+            return np.hypot(xr - car_x, yr - car_y)
 
         res = minimize_scalar(dist_sq, bounds=(a, b), method='bounded')
         return res.x, res.fun

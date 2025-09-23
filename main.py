@@ -6,11 +6,13 @@ from scipy.interpolate import splprep, splev
 from scipy.optimize import minimize_scalar
 import casadi as ca
 
+
 sim = Simulator()
 #create triangulation and midpoints
 sim.del_triangulation()
 midpoints, left_edge, right_edge = sim.create_midpoints()
 
+start_time = time.time()
 sim.order_cones(midpoints)
 #interpolate path, can access the path progress via spline object tck
 sim.spline_path(midpoints)
@@ -51,23 +53,20 @@ recorded_reference_velocity = []
 # Lists to record MPC states for plotting
 recorded_heading_error = []
 recorded_lateral_error = []
+recorded_net_acceleration = []
 
 ARC_LEN = sim.arc_length
 CAR_SHAPE = sim.car_vertices
+DRAG_COEFF = 0.004004009795398354 # drag coefficient
 
-
-def get_path_info(sim, s):
-    xr, yr = splev(s, sim.tck)
-
-    # First derivative (tangent)
-    dx, dy = splev(s, sim.tck, der=1)
-
-    # Second derivative (curvature-related)
-    ddx, ddy = splev(s, sim.tck, der=2)
+def get_path_info(total_path_info, s):
+    # Find the segment corresponding to the current s value
+    segment = int(s * (len(total_path_info) - 1))
+    xr, yr, dx, dy, ddx, ddy = total_path_info[segment]
 
     return xr, yr, dx, dy, ddx, ddy
 
-def compute_velocity_profiles(sim, num_points=10000 , initial_velocity=0.0):
+def compute_velocity_profiles(sim, total_path_info, num_points=10000 ,  initial_velocity=0.0):
     # Discretize spline
     s_vals = np.linspace(0, 1, num_points)
     arc_len = sim.arc_length
@@ -82,29 +81,53 @@ def compute_velocity_profiles(sim, num_points=10000 , initial_velocity=0.0):
     v_brake  = np.zeros(num_points)
     v_desired  = np.zeros(num_points)
 
+
     #cornering limit case, find the max velocity at all discretized points on the path that satisfy the cornering acceraltion constraint
     for i, s in enumerate(s_vals):
-        _, _, dx, dy, ddx, ddy = get_path_info(sim, s)
+        _, _, dx, dy, ddx, ddy = get_path_info(total_path_info, s)
         curvature = (dx*ddy - dy*ddx) / (dx**2 + dy**2)**1.5
 
         #edge case doesnt matter it will pick the smallest value anyway
         v_corner[i] = np.sqrt(MAX_TOTAL_ACCEL / abs(curvature))
 
     #forward sweep, having foresight to see maximum acceration feasible from the start, still constrained by teh cornering limit
-    v_accel[0] = 0.0
     for i in range(num_points-1):
+        _, _, dx, dy, ddx, ddy = get_path_info(total_path_info, s_vals[i])
+        curvature = (dx*ddy - dy*ddx) / max((dx**2 + dy**2)**1.5, 1e-9)
+        ay = v_accel[i]**2 * abs(curvature)
+        
+        # compute max longitudinal accel allowed by GG ellipse
+        if ay >= MAX_TOTAL_ACCEL:
+            ax_allowed = 0.0
+        else:
+            ax_allowed = WHEEL_ACCEL_MAX * np.sqrt(1 - (ay/MAX_TOTAL_ACCEL)**2)
+        
+        a_net = ax_allowed - DRAG_COEFF * v_accel[i]**2
+        a_net = max(0.0, a_net)   # don’t allow negative accel in forward pass
         v_accel[i+1] = min(
-            np.sqrt(v_accel[i]**2 + 2*WHEEL_ACCEL_MAX*ds),
+            np.sqrt(v_accel[i]**2 + 2*a_net*ds),
             v_corner[i+1]
         )
 
-    #backward sweep, having hindsight to see maximum decceleration feasible from the end, still constrained by the cornering limit
-    v_brake[-1] = v_accel[-1]  # start from end velocity
+    # Initialize v_brake with the end value of v_accel for backward sweep
+    v_brake[-1] = v_accel[-1]
+
+    # Backward sweep
     for i in range(num_points-2, -1, -1):
+        _, _, dx, dy, ddx, ddy = get_path_info(total_path_info, s_vals[i])
+        curvature = (dx*ddy - dy*ddx) / max((dx**2 + dy**2)**1.5, 1e-9)
+        ay = v_brake[i+1]**2 * abs(curvature)
+        
+        if ay >= MAX_TOTAL_ACCEL:
+            ax_allowed = 0.0
+        else:
+            ax_allowed = abs(WHEEL_ACCEL_MIN) * np.sqrt(1 - (ay/MAX_TOTAL_ACCEL)**2)
+        
         v_brake[i] = min(
-            np.sqrt(v_brake[i+1]**2 + 2*abs(WHEEL_ACCEL_MIN)*ds),
+            np.sqrt(max(v_brake[i+1]**2 + 2*ax_allowed*ds, 0.0)),
             v_corner[i]
         )
+            
 
     # --- Final profile: min of all three ---
     for i in range(num_points):
@@ -113,13 +136,34 @@ def compute_velocity_profiles(sim, num_points=10000 , initial_velocity=0.0):
 
     return [s_vals, v_corner, v_accel, v_brake, v_desired, arc_length_positions]
 
+def compute_path_profile(sim, num_points = 10000):
+    s_vals = np.linspace(0, 1, num_points)
+    total_path_info = []
+
+    for s in s_vals:
+        xr, yr = splev(s, sim.tck)
+
+        # First derivative (tangent)
+        dx, dy = splev(s, sim.tck, der=1)
+
+        # Second derivative (curvature-related)
+        ddx, ddy = splev(s, sim.tck, der=2)
+
+        total_path_info.append((xr, yr, dx, dy, ddx, ddy))
+    
+    return total_path_info
+
+
 #create velocity profile for entire track
-velocity_profiles = compute_velocity_profiles(sim)
+path_profile = compute_path_profile(sim)
+velocity_profiles = compute_velocity_profiles(sim, path_profile)
+
 
 # MPC throttling parameters
 MPC_UPDATE_PERIOD = 0.05  # run MPC every 50 ms (20 Hz)
 mpc_timer = 0.0          # elapsed sim time since last MPC solve
 last_mpc_rate = 0.0      # last steering rate chosen by MPC
+
 
 #PID
 v_integral_error = 0.0
@@ -130,17 +174,11 @@ v_Kp = 20.0
 v_Ki = 0.35
 v_Kd = 0.001
 
-# # pid for lat control
-# lat_integral_error = 0.0
-# lat_previous_error = 0.0
-# lat_Kp, lat_Ki, lat_Kd = 0.5, 0.0, 0.5  # <-- tune these
-
 dt = 0.01  # seconds per simulation step
 
 
 
 
-start_time = time.time()
 
 
 #build mpc for lateral control 
@@ -186,8 +224,7 @@ def build_lateral_mpc (N=100, dt=0.01, L=WHEELBASE,
         vx_k = v_safe * ca.cos(B)
         vy_k = v_safe * ca.sin(B)
 
-        denom = 1 - ey * kap_k
-        denom_safe = ca.if_else(ca.fabs(denom) < 1e-3, 1e-3, denom)
+        denom_safe = ca.fmax(1 - ey * kap_k, 1e-3)
         s_dot = (vx_k * ca.cos(psi) - vy_k * ca.sin(psi)) / denom_safe
 
 
@@ -269,6 +306,7 @@ def build_lateral_mpc (N=100, dt=0.01, L=WHEELBASE,
 
 #build mpc 
 mpc_solver, lbx, ubx, lbg, ubg, pack_params, unpack_solution, mpc_meta = build_lateral_mpc()
+last_mpc_solution = None
 
 def controller(x):
     """controller for a car
@@ -290,8 +328,9 @@ def controller(x):
         the maximum acceleration the car can handle (in x and y combined) is 12 meters per second per second.
         
     """
-    global sim, current_path_s, current_path_point, recorded_path_s, recorded_timestamps, past_s, ARC_LEN, CAR_SHAPE, recorded_car_x, recorded_car_y, velocity_profiles, recorded_velocity, recorded_acceleration_commands, recorded_reference_velocity, recorded_heading_error, recorded_lateral_error, mpc_timer, last_mpc_rate
-    
+    global sim, current_path_s, current_path_point, recorded_path_s, recorded_timestamps, past_s, ARC_LEN, CAR_SHAPE, recorded_car_x, recorded_car_y, velocity_profiles, recorded_velocity, recorded_acceleration_commands, recorded_reference_velocity, recorded_heading_error, recorded_lateral_error, recorded_net_acceleration, mpc_timer, last_mpc_rate, path_profile
+    start_time = time.perf_counter()  # Higher precision timer
+
 
     
     # EXTRACT STATE VARIABLES
@@ -326,7 +365,7 @@ def controller(x):
         else: 
             current_path_s = u2
             if b-1.0 > .9*(PATH_CHECK_FOW/ARC_LEN):
-                velocity_profiles = compute_velocity_profiles(sim, initial_velocity=velocity)
+                velocity_profiles = compute_velocity_profiles(sim, path_profile, initial_velocity=velocity)
                 
 
     else:
@@ -334,7 +373,7 @@ def controller(x):
         current_path_s, _ = sim.closest_point_on_spline(x, y, sim.tck, a, b)
 
     # Calculate SIGNED lateral deviation
-    xr, yr, dx, dy, ddx, ddy = get_path_info(sim, current_path_s)
+    xr, yr, dx, dy, ddx, ddy = get_path_info(path_profile, current_path_s)
     
     # Vector from path point to car
     car_to_path = np.array([x - xr, y - yr])
@@ -408,7 +447,7 @@ def controller(x):
             vseq.append(vref) 
 
             #use the s_val to follow indexing req for the velocity and apply to cuvature to the values are aligned
-            _, _, dx, dy, ddx, ddy = get_path_info(sim, s_val)
+            _, _, dx, dy, ddx, ddy = get_path_info(path_profile, s_val)
             kap.append((dx*ddy - dy*ddx) / (dx**2 + dy**2)**1.5)
         
             # 0-1 
@@ -420,9 +459,14 @@ def controller(x):
             s_index = int(s_val * (len(velocity_profiles[4]) - 1))
     
 
-        # Pack parameters and solve
+        # Pack parameters
         p = pack_params(x0, vseq, kap)
-        sol = mpc_solver(lbx=lbx, ubx=ubx, lbg=lbg, ubg=ubg, p=p)
+
+        # Warm-start if previous solution exists
+        if last_mpc_solution is not None:
+            sol = mpc_solver(lbx=lbx, ubx=ubx, lbg=lbg, ubg=ubg, p=p, x0=last_mpc_solution)
+        else:
+            sol = mpc_solver(lbx=lbx, ubx=ubx, lbg=lbg, ubg=ubg, p=p)
 
         X_opt, U_opt = unpack_solution(sol)
         last_mpc_rate = float(U_opt[0,0])   # take first control input
@@ -430,14 +474,9 @@ def controller(x):
     # return last known steering rate + current accel
     steering_rate = last_mpc_rate
 
-
-
-
-
-
-
-
-
+    # Calculate net acceleration (derivative of velocity)
+    net_accel = ((velocity**2)/current_curvature + np.abs(accel_control))
+    net_accel = accel_control + np.clip((velocity**2) * np.abs(current_curvature), 0, 12)  # m/s²
 
 
     # Record current path_s value, car position, velocity, acceleration, and timestamp for plotting
@@ -449,17 +488,21 @@ def controller(x):
     recorded_reference_velocity.append(v_reference)
     recorded_heading_error.append(epsi)
     recorded_lateral_error.append(e_y)
+    recorded_net_acceleration.append(net_accel)
     # Use simulation time (0.01 second timesteps) instead of wall-clock time
     recorded_timestamps.append(len(recorded_timestamps) * 0.01)
+    computation_time = time.perf_counter() - start_time  # Higher precision
+    print("current controller time: " + f"{computation_time:.6f}" + "    s value: " + f"{current_path_s:.6f}")
     past_s = current_path_s
 
-
-
+    accel_control = 10
+      # Show microsecond precision
     return np.array([accel_control, steering_rate])
 
 
 sim.set_controller(controller)
-sim.run()
+sim.run(20)
+print(time.time() - start_time)
 sim.animate()
 sim.plot()
 
@@ -555,12 +598,15 @@ def plot_velocity_and_mpc_analysis():
     ax1.grid(True, alpha=0.3)
     ax1.legend()
     
-    # Plot 2: Heading error over time
-    ax2.plot(recorded_timestamps, recorded_heading_error, 'r-', linewidth=2, alpha=0.8)
+    # Plot 2: Net acceleration over time
+    ax2.plot(recorded_timestamps, recorded_net_acceleration, 'r-', linewidth=2, alpha=0.8)
     ax2.axhline(y=0, color='black', linestyle='-', alpha=0.5)
-    ax2.set_ylabel('Heading Error (rad)')
-    ax2.set_title('Heading Error Over Time (Vehicle - Path)')
+    ax2.axhline(y=WHEEL_ACCEL_MAX, color='red', linestyle='--', alpha=0.7, label='Max Accel')
+    ax2.axhline(y=WHEEL_ACCEL_MIN, color='red', linestyle='--', alpha=0.7, label='Min Accel')
+    ax2.set_ylabel('Net Acceleration (m/s²)')
+    ax2.set_title('Net Acceleration Over Time (Actual Vehicle)')
     ax2.grid(True, alpha=0.3)
+    ax2.legend()
     
     # Plot 3: Lateral error over time
     ax3.plot(recorded_timestamps, recorded_lateral_error, 'orange', linewidth=2, alpha=0.8)
@@ -575,17 +621,20 @@ def plot_velocity_and_mpc_analysis():
         avg_velocity = np.mean(recorded_velocity)
         max_velocity = np.max(recorded_velocity)
         
-        # Calculate RMS errors
-        rms_heading_error = np.sqrt(np.mean([e**2 for e in recorded_heading_error]))
+        # Calculate RMS errors and acceleration statistics
         rms_lateral_error = np.sqrt(np.mean([e**2 for e in recorded_lateral_error]))
+        avg_net_accel = np.mean(recorded_net_acceleration)
+        max_net_accel = np.max(recorded_net_acceleration)
+        min_net_accel = np.min(recorded_net_acceleration)
         
         stats_text = f"""
         Performance Statistics:
         • Avg velocity: {avg_velocity:.2f} m/s
         • Max velocity: {max_velocity:.2f} m/s
-        • RMS heading error: {rms_heading_error:.3f} rad
         • RMS lateral error: {rms_lateral_error:.3f} m
-        • Final heading error: {recorded_heading_error[-1]:.3f} rad
+        • Avg net accel: {avg_net_accel:.2f} m/s²
+        • Max net accel: {max_net_accel:.2f} m/s²
+        • Min net accel: {min_net_accel:.2f} m/s²
         • Final lateral error: {recorded_lateral_error[-1]:.3f} m
         """
         
@@ -657,7 +706,10 @@ def plot_vel_profiles(velocity_profiles):
     # Add some statistics
     max_velocity = np.max(v_desired)
     avg_velocity = np.mean(v_desired)
-    min_velocity = np.min(v_desired[v_desired > 0])  # Exclude zero velocities
+    positive_velocities = v_desired[v_desired > 0]
+    min_velocity = np.min(positive_velocities) if len(positive_velocities) > 0 else 0.0  # Exclude zero velocities
+    
+    print(f"Debug: v_desired has {len(v_desired)} values, {len(positive_velocities)} are positive")
 
     stats_text = f"""
     Statistics:
@@ -674,6 +726,27 @@ def plot_vel_profiles(velocity_profiles):
     plt.show()
 
 # plot_vel_profiles(velocity_profiles)
+
+def estimate_drag_from_accel(v_data, t_data):
+    v_data = np.array(v_data)
+    t_data = np.array(t_data)
+
+    # numerical derivative dv/dt
+    dv_dt = np.gradient(v_data, t_data)
+
+    # use only valid region
+    mask = v_data > 1e-2
+    x = v_data[mask]**2
+    y = dv_dt[mask]
+
+    # fit y = a*x (force zero intercept) where y = dv/dt and x = v^2
+    # so dv/dt = a*v^2, where a is the drag coefficient
+    a = np.sum(x * y) / np.sum(x * x)  # least squares solution for y = ax
+    
+    k = -a   # drag coefficient is negative of slope (since drag opposes motion)
+    print("drag_coeff: " + str(k))
+
+# estimate_drag_from_accel(recorded_velocity, recorded_timestamps)
 
 # Plot analysis of velocity and MPC performance
 plot_velocity_and_mpc_analysis()
