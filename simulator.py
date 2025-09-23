@@ -357,7 +357,7 @@ class Simulator:
 
         # create the spline object tck and the index u of path progress
         # per=1 makes it periodic (closed loop) - connects end back to start
-        self.tck, self.u = splprep([x, y], s=0, per=1)
+        self.tck, self.u = splprep([x, y], s=2, per=1)
 
         # Calculate arc length using numerical integration
         u_samples = np.linspace(0, 1, 2000)
@@ -530,6 +530,7 @@ class Simulator:
         axs[1].set_title('net acceleration')
         axs[1].set_xlabel('time (s)')
         axs[1].set_ylabel('acceleration (m/s^2)')
+        axs[1].set_ylim([-1, 20])
 
         ts, xs, us, crash, slip = self.get_results()
         accel_values = np.array([self._get_accel(x, u) for x, u in zip(xs.T, us.T)])

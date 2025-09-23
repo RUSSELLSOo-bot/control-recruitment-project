@@ -23,7 +23,7 @@ WHEEL_ANG_MAX = 0.7  # radians
 WHEEL_ANG_MIN = -0.7  # radians
 STEERING_RATE_MAX = 1.0  # radians per second
 STEERING_RATE_MIN = -1.0  # radians per second
-WHEEL_ACCEL_MAX = 10.0  # meters per second squared
+WHEEL_ACCEL_MAX = 4.0  # meters per second squared
 WHEEL_ACCEL_MIN = -4.0  # meters per second squared
 MAX_TOTAL_ACCEL = 12.0  # meters per second squared
 MIN_TURN_RADIUS = WHEELBASE / np.tan(WHEEL_ANG_MAX)  # meters
@@ -80,6 +80,10 @@ def compute_velocity_profiles(sim, total_path_info, num_points=10000 ,  initial_
     v_accel  = np.zeros(num_points)
     v_brake  = np.zeros(num_points)
     v_desired  = np.zeros(num_points)
+    net_accel = np.zeros(num_points)  # store net acceleration (longitudinal + lateral envelope) at each point
+
+    # Initialize forward-pass starting velocity with provided initial_velocity
+    v_accel[0] = float(initial_velocity)
 
 
     #cornering limit case, find the max velocity at all discretized points on the path that satisfy the cornering acceraltion constraint
@@ -108,6 +112,8 @@ def compute_velocity_profiles(sim, total_path_info, num_points=10000 ,  initial_
             np.sqrt(v_accel[i]**2 + 2*a_net*ds),
             v_corner[i+1]
         )
+        # record forward-pass net accel (longitudinal available after cornering + drag)
+        net_accel[i] = a_net
 
     # Initialize v_brake with the end value of v_accel for backward sweep
     v_brake[-1] = v_accel[-1]
@@ -127,14 +133,20 @@ def compute_velocity_profiles(sim, total_path_info, num_points=10000 ,  initial_
             np.sqrt(max(v_brake[i+1]**2 + 2*ax_allowed*ds, 0.0)),
             v_corner[i]
         )
+        # for braking/backward pass, treat ax_allowed as braking capability (positive magnitude)
+        # store braking net accel as negative longitudinal decel (if desired we keep magnitude)
+        net_accel[i] = -abs(ax_allowed)
             
 
     # --- Final profile: min of all three ---
     for i in range(num_points):
         v_desired[i] = min(v_corner[i], v_accel[i], v_brake[i])
 
+    # Ensure net_accel last point is set (use forward-pass last computed or 0)
+    net_accel[-1] = net_accel[-2] if num_points > 1 else 0.0
 
-    return [s_vals, v_corner, v_accel, v_brake, v_desired, arc_length_positions]
+
+    return [s_vals, v_corner, v_accel, v_brake, v_desired, arc_length_positions, net_accel]
 
 def compute_path_profile(sim, num_points = 10000):
     s_vals = np.linspace(0, 1, num_points)
@@ -177,7 +189,9 @@ v_Kd = 0.001
 dt = 0.01  # seconds per simulation step
 
 
-
+lap_times = []
+lap_count = 0
+last_lap_time = 0.0
 
 
 
@@ -203,8 +217,8 @@ def build_lateral_mpc (N=100, dt=0.01, L=WHEELBASE,
     kap  = ca.SX.sym('kap',N)
 
     # cost weights (tune later)
-    w_ey, w_psi, w_theta = 2.0, 9.0, 0.01
-
+    w_ey, w_psi, w_theta = 0.5, 20.0, 0.01
+    w_dtheta = 10.0 
     J = 0
     g = []; lbg = []; ubg = []
 
@@ -241,6 +255,8 @@ def build_lateral_mpc (N=100, dt=0.01, L=WHEELBASE,
 
         #stage cost 
         J += w_ey*ey**2 + w_psi*psi**2 + w_theta*theta**2 
+        # steering effort penalties
+        J += w_theta*theta**2 + w_dtheta*dtheta**2
 
     #terminal cost
     eyN, psiN, thetaN = X[0,N], X[1,N], X[2,N]
@@ -328,7 +344,7 @@ def controller(x):
         the maximum acceleration the car can handle (in x and y combined) is 12 meters per second per second.
         
     """
-    global sim, current_path_s, current_path_point, recorded_path_s, recorded_timestamps, past_s, ARC_LEN, CAR_SHAPE, recorded_car_x, recorded_car_y, velocity_profiles, recorded_velocity, recorded_acceleration_commands, recorded_reference_velocity, recorded_heading_error, recorded_lateral_error, recorded_net_acceleration, mpc_timer, last_mpc_rate, path_profile
+    global sim, current_path_s, current_path_point, recorded_path_s, recorded_timestamps, past_s, ARC_LEN, CAR_SHAPE, recorded_car_x, recorded_car_y, velocity_profiles, recorded_velocity, recorded_acceleration_commands, recorded_reference_velocity, recorded_heading_error, recorded_lateral_error, recorded_net_acceleration, mpc_timer, last_mpc_rate, path_profile, lap_time
     start_time = time.perf_counter()  # Higher precision timer
 
 
@@ -364,13 +380,15 @@ def controller(x):
             current_path_s = u1
         else: 
             current_path_s = u2
-            if b-1.0 > .9*(PATH_CHECK_FOW/ARC_LEN):
-                velocity_profiles = compute_velocity_profiles(sim, path_profile, initial_velocity=velocity)
-                
-
     else:
         # normal case
         current_path_s, _ = sim.closest_point_on_spline(x, y, sim.tck, a, b)
+
+    # Detect lap wrap (we passed from s near 1.0 to s near 0.0) and recompute velocity profile
+    # If past_s was large and current_path_s is small, assume we've completed a lap
+    if past_s > current_path_s:
+        velocity_profiles = compute_velocity_profiles(sim, path_profile, initial_velocity=velocity)
+
 
     # Calculate SIGNED lateral deviation
     xr, yr, dx, dy, ddx, ddy = get_path_info(path_profile, current_path_s)
@@ -476,7 +494,7 @@ def controller(x):
 
     # Calculate net acceleration (derivative of velocity)
     net_accel = ((velocity**2)/current_curvature + np.abs(accel_control))
-    net_accel = accel_control + np.clip((velocity**2) * np.abs(current_curvature), 0, 12)  # m/s²
+    net_accel = np.clip((velocity**2) * np.abs(current_curvature), 0, 12)  # m/s²
 
 
     # Record current path_s value, car position, velocity, acceleration, and timestamp for plotting
@@ -493,9 +511,28 @@ def controller(x):
     recorded_timestamps.append(len(recorded_timestamps) * 0.01)
     computation_time = time.perf_counter() - start_time  # Higher precision
     print("current controller time: " + f"{computation_time:.6f}" + "    s value: " + f"{current_path_s:.6f}")
+    
+    # Lap detection: if s wrapped (we went from a larger past_s to smaller current_path_s)
+    global lap_count, last_lap_time, lap_times
+    
+    if past_s > current_path_s:
+        # current simulated time (seconds)
+        sim_time_now = len(recorded_timestamps) * dt
+        if last_lap_time == 0.0:
+            lap_duration = sim_time_now
+        else:
+            lap_duration = sim_time_now - last_lap_time
+        # Filter out spurious/very-short laps (ignore durations < 1 second)
+        if lap_duration >= 2.0:
+            lap_times.append(lap_duration)
+            last_lap_time = sim_time_now
+            lap_count += 1
+        else:
+            # ignore short false-positive lap
+            pass
+    
     past_s = current_path_s
 
-    accel_control = 10
       # Show microsecond precision
     return np.array([accel_control, steering_rate])
 
@@ -503,6 +540,14 @@ def controller(x):
 sim.set_controller(controller)
 sim.run(20)
 print(time.time() - start_time)
+# Print lap times collected during the simulation
+if len(lap_times) > 0:
+    print(f"Laps completed: {len(lap_times)}")
+    for i, t in enumerate(lap_times, start=1):
+        print(f"Lap {i}: {t:.3f} s")
+else:
+    print("No laps detected.")
+
 sim.animate()
 sim.plot()
 
@@ -690,24 +735,39 @@ def plot_velocity_vs_position():
 
 
 def plot_vel_profiles(velocity_profiles):
-    s_vals, v_corner, v_accel, v_brake, v_desired, arc_length_positions = velocity_profiles
+    s_vals, v_corner, v_accel, v_brake, v_desired, arc_length_positions, net_accel = velocity_profiles
 
     # --- Plot with arc length instead of point indices ---
-    plt.figure(figsize=(12,6))
-    plt.plot(arc_length_positions, v_brake, 'r-', label="Braking Limit", linewidth=2, alpha=0.8)
-    plt.plot(arc_length_positions, v_accel, 'y-', label="Accelerating Limit", linewidth=2, alpha=0.8)
-    plt.plot(arc_length_positions, v_desired, 'b-', label="Final Velocity Profile", linewidth=3)
-    plt.xlabel("Arc Length [m]")
-    plt.ylabel("Velocity [m/s]")
-    plt.title(f"Velocity Profile vs Arc Length (Total track length: {ARC_LEN:.2f} m)")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    fig, ax1 = plt.subplots(figsize=(12,6))
+    ax1.plot(arc_length_positions, v_brake, 'r-', label="Braking Limit", linewidth=2, alpha=0.8)
+    ax1.plot(arc_length_positions, v_accel, 'y-', label="Accelerating Limit", linewidth=2, alpha=0.8)
+    ax1.plot(arc_length_positions, v_desired, 'b-', label="Final Velocity Profile", linewidth=3)
+    ax1.set_xlabel("Arc Length [m]")
+    ax1.set_ylabel("Velocity [m/s]")
+    ax1.set_title(f"Velocity Profile vs Arc Length (Total track length: {ARC_LEN:.2f} m)")
+    ax1.grid(True, alpha=0.3)
+
+    # Secondary axis for net acceleration
+    ax2 = ax1.twinx()
+    ax2.plot(arc_length_positions, net_accel, color='tab:green', linestyle='--', linewidth=2, label='Net Acceleration')
+    ax2.set_ylabel('Net Acceleration [m/s²]', color='tab:green')
+    ax2.tick_params(axis='y', labelcolor='tab:green')
+
+    # Combine legends from both axes
+    lines_1, labels_1 = ax1.get_legend_handles_labels()
+    lines_2, labels_2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper right')
     
     # Add some statistics
     max_velocity = np.max(v_desired)
     avg_velocity = np.mean(v_desired)
     positive_velocities = v_desired[v_desired > 0]
     min_velocity = np.min(positive_velocities) if len(positive_velocities) > 0 else 0.0  # Exclude zero velocities
+
+    # Net accel stats
+    avg_net_accel = np.mean(net_accel)
+    max_net_accel = np.max(net_accel)
+    min_net_accel = np.min(net_accel)
     
     print(f"Debug: v_desired has {len(v_desired)} values, {len(positive_velocities)} are positive")
 
@@ -716,6 +776,9 @@ def plot_vel_profiles(velocity_profiles):
     • Max velocity: {max_velocity:.2f} m/s
     • Avg velocity: {avg_velocity:.2f} m/s
     • Min velocity: {min_velocity:.2f} m/s
+    • Avg net accel: {avg_net_accel:.2f} m/s²
+    • Max net accel: {max_net_accel:.2f} m/s²
+    • Min net accel: {min_net_accel:.2f} m/s²
     • Track length: {ARC_LEN:.2f} m
     """
     
@@ -725,7 +788,7 @@ def plot_vel_profiles(velocity_profiles):
     
     plt.show()
 
-# plot_vel_profiles(velocity_profiles)
+plot_vel_profiles(velocity_profiles)
 
 def estimate_drag_from_accel(v_data, t_data):
     v_data = np.array(v_data)
