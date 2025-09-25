@@ -25,7 +25,7 @@ STEERING_RATE_MAX = 1.0  # radians per second
 STEERING_RATE_MIN = -1.0  # radians per second
 WHEEL_ACCEL_MAX = 4.0  # meters per second squared
 WHEEL_ACCEL_MIN = -4.0  # meters per second squared
-MAX_TOTAL_ACCEL = 12.0  # meters per second squared
+MAX_TOTAL_ACCEL =  0.95 * 12.0  # meters per second squared
 MIN_TURN_RADIUS = WHEELBASE / np.tan(WHEEL_ANG_MAX)  # meters
 
 # Path following parameters
@@ -57,7 +57,7 @@ recorded_net_acceleration = []
 
 ARC_LEN = sim.arc_length
 CAR_SHAPE = sim.car_vertices
-DRAG_COEFF = 0.004004009795398354 # drag coefficient
+DRAG_COEFF = 0.00604009795398354 # drag coefficient
 
 def get_path_info(total_path_info, s):
     # Find the segment corresponding to the current s value
@@ -172,7 +172,7 @@ velocity_profiles = compute_velocity_profiles(sim, path_profile)
 
 
 # MPC throttling parameters
-MPC_UPDATE_PERIOD = 0.05  # run MPC every 50 ms (20 Hz)
+MPC_UPDATE_PERIOD = 0.01  # run MPC every 50 ms (20 Hz)
 mpc_timer = 0.0          # elapsed sim time since last MPC solve
 last_mpc_rate = 0.0      # last steering rate chosen by MPC
 
@@ -211,14 +211,17 @@ def build_lateral_mpc (N=100, dt=0.01, L=WHEELBASE,
     X = ca.SX.sym('X', nx, N+1)
     U = ca.SX.sym('U', nu, N)
 
-    #initial state, velocity over the horizon, path curvature over the horizon
+    #initial state, velocity over the horizon, path curvature over the horizon, longitudinal acceleration over the horizon
     x0   = ca.SX.sym('x0', nx)
     vseq = ca.SX.sym('v',  N)
     kap  = ca.SX.sym('kap',N)
+    
 
     # cost weights (tune later)
-    w_ey, w_psi, w_theta = 0.5, 20.0, 0.01
-    w_dtheta = 10.0 
+    w_ey, w_psi, w_theta = 2, 10.0, 0.01
+    w_dtheta = 1.0
+    #w_ey, w_psi, w_theta = 0.5, 20.0, 0.01
+    #w_dtheta = 10.0 
     J = 0
     g = []; lbg = []; ubg = []
 
@@ -253,6 +256,10 @@ def build_lateral_mpc (N=100, dt=0.01, L=WHEELBASE,
         lbg += [0, 0, 0]
         ubg += [0, 0, 0]
 
+
+        
+        
+
         #stage cost 
         J += w_ey*ey**2 + w_psi*psi**2 + w_theta*theta**2 
         # steering effort penalties
@@ -266,16 +273,20 @@ def build_lateral_mpc (N=100, dt=0.01, L=WHEELBASE,
     opt_vars = ca.vertcat(ca.reshape(X, -1, 1), ca.reshape(U, -1, 1))
 
     #hard constraints
+    # --- Hard constraints ---
     lbx = []; ubx = []
-    # States bounds: only theta is bounded; (ey, epsi) unbounded here
+    # States: ey, epsi unbounded; theta will be set dynamically at runtime
     for k in range(N+1):
-        lbx += [-ca.inf, -ca.inf, theta_min]
-        ubx += [ ca.inf,  ca.inf, theta_max]
-    #dtheta bounds
-    for k in range(N):
-        lbx += [dtheta_min]
-        ubx += [dtheta_max]
+        lbx += [-np.inf, -np.inf, -np.inf]   # placeholder
+        ubx += [ np.inf,  np.inf,  np.inf]   # placeholder
 
+    # Controls: dtheta only (ax handled separately in PID)
+    for k in range(N):
+        lbx += [STEERING_RATE_MIN]
+        ubx += [STEERING_RATE_MAX]
+
+
+    
     # Pack constraints and parameters
     g_all = ca.vertcat(*g)
     p_all = ca.vertcat(x0, vseq, kap)
@@ -296,14 +307,11 @@ def build_lateral_mpc (N=100, dt=0.01, L=WHEELBASE,
     nxTot = nx*(N+1); nuTot = nu*N
 
     def pack_params(x0_val, vseq_val, kap_val):
-        """
-        x0_val: shape (3,), [ey, epsi, theta]
-        vseq_val: shape (N,)
-        kap_val:  shape (N,)
-        """
-        return np.concatenate([np.asarray(x0_val).ravel(),
-                               np.asarray(vseq_val).ravel(),
-                               np.asarray(kap_val).ravel()]).reshape(-1,1)
+        return np.concatenate([
+            np.asarray(x0_val).ravel(),
+            np.asarray(vseq_val).ravel(),
+            np.asarray(kap_val).ravel()
+        ]).reshape(-1,1)
 
     def unpack_solution(sol):
         w = np.array(sol['x']).reshape(-1)
@@ -432,8 +440,25 @@ def controller(x):
 
     v_previous_error = v_error
 
-    #create feasible acceleration command 
-    accel_control = np.clip(v_Kp * v_error +    v_Ki * v_integral_error +   v_Kd * v_derivative_error, WHEEL_ACCEL_MIN, WHEEL_ACCEL_MAX)
+    # Calculate centripetal acceleration being used for steering
+    # a_centripetal = v^2 / R, where R is the radius of curvature
+    
+    centripetal_accel = velocity**2/WHEELBASE * np.tan(steering_angle)
+    
+    
+    # Calculate remaining acceleration budget for longitudinal acceleration
+    # Total acceleration constraint: sqrt(a_longitudinal^2 + a_centripetal^2) <= MAX_TOTAL_ACCEL
+    # Therefore: a_longitudinal_max = sqrt(MAX_TOTAL_ACCEL^2 - a_centripetal^2)
+    remaining_accel_budget = np.sqrt(max(0, MAX_TOTAL_ACCEL**2 - centripetal_accel**2))
+    
+    # Apply PID control with the remaining acceleration budget
+    pid_accel = v_Kp * v_error + v_Ki * v_integral_error + v_Kd * v_derivative_error
+    
+    # Clip to both the wheel limits and the remaining acceleration budget
+    max_feasible_accel = min(WHEEL_ACCEL_MAX, remaining_accel_budget)
+    min_feasible_accel = max(WHEEL_ACCEL_MIN, -remaining_accel_budget)
+    
+    accel_control = np.clip(pid_accel, min_feasible_accel, max_feasible_accel)
     
     # Calculate MPC state variables for recording (always compute these)
     e_y   = lat_dev
@@ -457,34 +482,60 @@ def controller(x):
         s_val = current_path_s
         kap  = []
         vseq = []
+        theta_bounds = []
 
-        for index in range(N): 
-            #for each run, we have to find the reference velocity, append the velocity to the vseq array, and predict the next s value given
-            # that velocity by projecting it accross dt seconds 
+
+        s_val = current_path_s
+
+        for index in range(N):
             vref = velocity_profiles[4][s_index]
-            vseq.append(vref) 
+            vseq.append(vref)
 
-            #use the s_val to follow indexing req for the velocity and apply to cuvature to the values are aligned
+            # curvature at this s
             _, _, dx, dy, ddx, ddy = get_path_info(path_profile, s_val)
             kap.append((dx*ddy - dy*ddx) / (dx**2 + dy**2)**1.5)
-        
-            # 0-1 
+            
+            if index == 0:
+                ax_val = np.clip(accel_control, WHEEL_ACCEL_MIN, WHEEL_ACCEL_MAX)
+            else:
+                delta_v = vseq[index] - vseq[index-1]
+                avg_v   = 0.5 * (vseq[index] + vseq[index-1])
+                ax_val  = delta_v *avg_v / (ds*ARC_LEN)
+
+            # ds in [0,1]
             ds = (vref * dt) / ARC_LEN
 
-            
-            s_val = (s_val + ds) % 1.0
+            # dynamic steering bound from GG ellipse
+            ay_max = max(0.0, np.abs(MAX_TOTAL_ACCEL) - np.abs(ax_val))
+            theta_bound = np.arctan(WHEELBASE * ay_max / (vref**2 + 1e-6))
+            theta_bound = np.clip(theta_bound, WHEEL_ANG_MIN, WHEEL_ANG_MAX)
+            theta_bounds.append(theta_bound)
 
+            # advance along track
+            s_val = (s_val + ds) % 1.0
             s_index = int(s_val * (len(velocity_profiles[4]) - 1))
-    
+
+        # --- Now build dynamic lbx/ubx ---
+        lbx_dyn = []
+        ubx_dyn = []
+        #print(f"{delta_v:.5f}        {ds:.5f}    {ax_val:.5f} {ARC_LEN:.5f} ")
+        for k in range(N+1):
+            lbx_dyn += [-np.inf, -np.inf, -theta_bounds[min(k, N-1)]]
+            ubx_dyn += [ np.inf,  np.inf,  theta_bounds[min(k, N-1)]]
+
+        for k in range(N):
+            lbx_dyn += [STEERING_RATE_MIN]
+            ubx_dyn += [STEERING_RATE_MAX]
+
 
         # Pack parameters
         p = pack_params(x0, vseq, kap)
 
         # Warm-start if previous solution exists
         if last_mpc_solution is not None:
-            sol = mpc_solver(lbx=lbx, ubx=ubx, lbg=lbg, ubg=ubg, p=p, x0=last_mpc_solution)
+            sol = mpc_solver(lbx=lbx_dyn, ubx=ubx_dyn, lbg=lbg, ubg=ubg, p=p, x0=last_mpc_solution)
         else:
-            sol = mpc_solver(lbx=lbx, ubx=ubx, lbg=lbg, ubg=ubg, p=p)
+            sol = mpc_solver(lbx=lbx_dyn, ubx=ubx_dyn, lbg=lbg, ubg=ubg, p=p)
 
         X_opt, U_opt = unpack_solution(sol)
         last_mpc_rate = float(U_opt[0,0])   # take first control input
@@ -510,8 +561,7 @@ def controller(x):
     # Use simulation time (0.01 second timesteps) instead of wall-clock time
     recorded_timestamps.append(len(recorded_timestamps) * 0.01)
     computation_time = time.perf_counter() - start_time  # Higher precision
-    print("current controller time: " + f"{computation_time:.6f}" + "    s value: " + f"{current_path_s:.6f}")
-    
+    print("current controller time: " + f"{computation_time:.6f}" + "    s value: " + f"{current_path_s:.6f}" )
     # Lap detection: if s wrapped (we went from a larger past_s to smaller current_path_s)
     global lap_count, last_lap_time, lap_times
     
@@ -533,7 +583,7 @@ def controller(x):
     
     past_s = current_path_s
 
-      # Show microsecond precision
+    
     return np.array([accel_control, steering_rate])
 
 
