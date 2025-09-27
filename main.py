@@ -172,7 +172,7 @@ velocity_profiles = compute_velocity_profiles(sim, path_profile)
 
 
 # MPC throttling parameters
-MPC_UPDATE_PERIOD = 0.01  # run MPC every 50 ms (20 Hz)
+MPC_UPDATE_PERIOD = 0.05  # run MPC every 50 ms (20 Hz)
 mpc_timer = 0.0          # elapsed sim time since last MPC solve
 last_mpc_rate = 0.0      # last steering rate chosen by MPC
 
