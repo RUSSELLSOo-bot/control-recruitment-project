@@ -3,6 +3,8 @@
 
 # FEB Autonomous Recruitment Project
 
+![Demo](Figure1 2025-11-02 21-15-25-ezgif.com-video-to-gif-converter.gif)
+
 The goal of this project is to design and implement something to drive a car around a track while avoiding cones.
 
 More specifically, you must write a function that takes in a single argument (the state of the car) $[x \, y \, \phi \, v \, \theta ]$ and returns a single control command $[a \, \dot{\theta}]$.
