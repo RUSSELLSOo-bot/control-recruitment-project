@@ -3,7 +3,7 @@
 
 # FEB Autonomous Recruitment Project
 
-![Demo](Figure1 2025-11-02 21-15-25-ezgif.com-video-to-gif-converter.gif)
+![Demo](Figure1%202025-11-02%2021-15-25-ezgif.com-video-to-gif-converter.gif)
 
 The goal of this project is to design and implement something to drive a car around a track while avoiding cones.
 
