@@ -1,122 +1,164 @@
-> [!NOTE]
-> I have made changes to the code as of 4:45pm on 9/10. I don't anticipate any further code changes, but I will be updating the readme with more resources and information regularly.
+# FEB Autonomous Car Controller
 
-# FEB Autonomous Recruitment Project
+<div align="center">
+  <img src="demo.gif" width="520" alt="Autonomous lap demo">
+</div>
 
-![Demo](Figure1%202025-11-02%2021-15-25-ezgif.com-video-to-gif-converter.gif)
+This project implements a full autonomous driving controller for a cone-defined racetrack.
 
-The goal of this project is to design and implement something to drive a car around a track while avoiding cones.
+The system constructs a smooth spline path from raw cone positions, generates a physically feasible velocity
+profile using combined lateral/longitudinal acceleration limits, and drives the vehicle with a combination of
+**PID longitudinal control** and **Model Predictive Control (MPC)** for steering.
 
-More specifically, you must write a function that takes in a single argument (the state of the car) $[x \, y \, \phi \, v \, \theta ]$ and returns a single control command $[a \, \dot{\theta}]$.
+The result is a stable, smooth lap with correct handling in straights, corners, and chicanes—while fully obeying
+vehicle limits on steering, steering rate, and acceleration.
 
-These variables represent the following quantities:
-- $x$ and $y$ are the position of the car, in meters.
-- $\phi$ is the heading of the car, in radians (zero is pointing directly left)
-- $v$ is the velocity of the car, in meters per second.
-- $\theta$ is the angle of the front wheels, in radians.
-- $a$ is the requested acceleration for the car. Think of this more as the normalized force $\frac{F}{m}$ - the car is subject to aerodynamic drag and will not keep accelerating infinitely.
-- $\dot{\theta}$ is the time derivative of the steering angle $\theta$. it is a control input. We assume that the steer-by-wire system can acheive high accelerations here, so we don't need to worry about changing this value quickly.
+---
 
-There are also the following constraints:
+## 🚗 Overview
 
-| variable       | lower bound | upper bound |
-| -------------- | ----------- | ----------- |
-| $\theta$       | -0.7        | 0.7         |
-| $\dot{\theta}$ | -1.0        | 1.0         |
-| $a$            | -4          | 10          |
+The vehicle is represented by a 5-state model:
 
-The only other important numbers that you do not get to choose are:
-- the wheelbase (distance between front and rear wheels) is 1.58 meters.
-- the maximum acceleration the car can handle (in $x$ and $y$ combined) is 12 meters per second per second.
-- the outer geometry of the car is a convex polygon with vertices accesible through the `Simulator.car_vertices` property.
+$$
+[x,\; y,\; \phi,\; v,\; \theta]
+$$
 
-## Implementation
+- $x, y$: position  
+- $\phi$: heading  
+- $v$: velocity  
+- $\theta$: steering angle  
 
-Please write your implementation in the `controller` method of `main.py`. You may read or modify anything you want in `simulator.py` for development but make sure your code works with the original simulator class before submission.
+The controller outputs:
 
-Provided in `simulator.py` is the `Simulator` class, which has:
-- some basic visualization utilities (`.plot()` and `.animate()`)
-- the variable bounds (`.steering_limits`, `.lbu`, and `.ubu`)
-- the car outline vertices (`.car_vertices`)
-- `.get_results` to see how the simulation went
-- `.run()` to run the simulation.
+$$
+[a,\; \dot{\theta}]
+$$
 
-You can also get the centerline of the track, parameterized by distance (in meters), using the `centerline` function:
-```
->>> help(centerline)
-Help on vectorize in module numpy:
+- $a$: commanded acceleration  
+- $\dot{\theta}$: steering rate  
 
-<lambda> = <numpy.vectorize object>
-    get track centerline at distance `x` from the start.
-    
-    Args:
-        x (float or array-like): distance along centerline to get.
-    
-    Returns:
-        array: shape (2,) if `x` is a float or (N, 2) if `x` is an array-like of length N.
->>> 
-```
+Simulation runs at **100 Hz**, and the MPC solves at **20 Hz**.
 
-In order to run this simulation, you'll need to install `casadi`, `matplotlib`, and `numpy`.
-All can be installed with `pip` (ie, `pip install casadi matplotlib numpy`)
+---
 
-We recommend you fork this repo and develop your code there (so you can keep history with git/github), but you do not need to. You can just clone this repo or download the .zip file and work locally.
+## 🛣 Track Processing & Path Generation
 
-If you don't want to run anything locally (if you don't have python, or there's something funny with your default C compiler, or any other reason), this code works in google colab. Just make a new notebook and add the following as the first cell:
+1. Cones are processed using Delaunay triangulation.  
+2. Midpoints between cone pairs are ordered into a continuous racing corridor.  
+3. A **cubic B-spline** is fit through the midpoints.  
+4. The spline is parameterized in normalized arc-length $s \in [0,1]$.
 
-```
-!pip install casadi
-!git clone git@github.com:FEBAutonomous/control-recruitment-project.git
-```
+For any value of $s$, we can compute:
 
-Then you can copy the contents of `main.py` in: 
+- position on the path  
+- tangent direction  
+- curvature  
+- second derivative  
 
-```python
-import numpy as np
-from simulator import Simulator, centerline
+This enables fast closest-point projection and curvature-based speed limits.
 
-sim = Simulator()
+---
 
-def controller(x):
-    """
-    <docstring excluded for brevity>
-    """
-    ...
+## ⚡ Physically Feasible Velocity Profile (GG-Diagram)
 
-sim.set_controller(controller)
-sim.run()
-sim.animate()
-sim.plot()
-```
+To prevent the vehicle from exceeding physical tire limits, the controller enforces a maximum combined acceleration of **12 m/s²**.
 
-I'm not sure if `sim.animate()` will work in colab, but if it doesn't, you can just pass `sim.animate(save=True)` and look at the resulting gif.
+Cornering acceleration:
 
+$$
+a_{\text{lat}} = v^2 \lvert \kappa \rvert
+$$
 
-## Presentation & Submission
+Maximum safe cornering speed:
 
-When you present your project, you will have roughly 10-15 minutes to showcase everything you've done in just these two weeks (please do not show us anything not directly related to this project). The goal is to show:
-- *why* you did what you did
-- what you learned
-- what problems you encountered and how you solved them
+$$
+v_{\text{corner}} = \sqrt{\frac{a_{\text{max}}}{\lvert \kappa \rvert}}
+$$
 
-Whatever medium you think is best for this is fine; we're not particularly concerned about your graphic design or presentation skills beyond what is needed to communicate the core ideas here.
+The algorithm computes:
 
-You will also submit a zip file of your finalized code.
+- a forward pass (acceleration-feasible)  
+- a backward pass (braking-feasible)  
+- drag-limited acceleration  
 
+Final reference profile:
 
-## Resources
-outside of [office hours](https://docs.google.com/spreadsheets/d/1ifnzajpgu3X9_jV493kc64A2R6CjR8UqbLQ9SasroNY/edit?gid=1214868707#gid=1214868707), here are a couple resources to give various bits of background on controls:
+$$
+v_{\text{desired}} = \min\!\left(v_{\text{corner}},\; v_{\text{accel}},\; v_{\text{brake}}\right)
+$$
 
-- The Matlab control videos provide a very good introduction to the idea of control and control theory. 
-  - [control intro](https://youtu.be/lBC1nEq0_nk?si=m6OHT0HWrKCxY3qO)
-  - [PID controller](https://www.youtube.com/watch?v=wkfEZmsQqiA)
-  - [LQR controller](https://www.youtube.com/watch?v=E_RDCFOlJx4)
-  - [intro to state space](https://www.youtube.com/watch?v=hpeKrMG-WP0)
-  - [practical controls](https://www.youtube.com/watch?v=ApMz1-MK9IQ)
-- Steve Brunton's [control bootcamp](https://youtube.com/playlist?list=PLMrJAkhIeNNR20Mz-VpzgfQs5zrYi085m&si=FHHTSASSBPVFrT2r) is very good for getting the mathematical foundations of control theory. It's a very long playlist and I don't recommend watching all of it (because it gets way more advanced that you need for this), but if you watch videos 1-6 as well as 12 and 13, it should really help you understand any control literature you read.
-- [Intro to Robot Motion: Theory, Algorithms, and Implementations](https://reid.xz.ax/swbible) is way too long and in depth, but appendix J is a good primer on linear control.
-- [Purdue SigBots](https://wiki.purduesigbots.com/software/control-algorithms) has a nice wiki.
-- [WPIlib](https://docs.wpilib.org/en/stable/docs/software/advanced-controls/state-space/index.html) may be familiar to you and has a good controls primer.
+This ensures the car slows appropriately for tight corners and accelerates efficiently on straights.
 
-Run from the x64 Native Tools Command Prompt 
-code .
+---
+
+## 🎯 Longitudinal Control (PID)
+
+A PID controller tracks the desired velocity profile.  
+Before applying the acceleration command, it is constrained by:
+
+- wheel acceleration limits  
+- remaining GG-envelope after lateral load  
+- aerodynamic drag  
+
+This produces human-like behavior:
+
+- ✅ full throttle on straights  
+- ✅ smooth braking into corners  
+- ✅ seamless transitions  
+
+---
+
+## 🧠 Lateral Control (MPC)
+
+Steering is computed with a nonlinear CasADi MPC.
+
+The MPC uses the state:
+
+$$
+[e_y,\; e_\psi,\; \theta]
+$$
+
+where $e_y$ is lateral deviation and $e_\psi$ is heading error.
+
+The cost function penalizes:
+
+- lateral error  
+- heading error  
+- steering effort  
+
+Steering limits are dynamically tightened based on predicted velocity and curvature, ensuring stability at high speeds.
+
+The result is precise centerline tracking with very low oscillation.
+
+---
+
+## 📊 Logging, Plots & Analysis
+
+The controller records:
+
+- path progress  
+- lateral error  
+- heading error  
+- reference vs actual velocity  
+- net acceleration usage  
+- car position  
+- lap detection and lap times  
+
+Tools provided:
+
+| Function | Description |
+|----------|-------------|
+| `plot_velocity_and_mpc_analysis()` | velocity tracking & lateral error over time |
+| `plot_velocity_vs_position()` | velocity & acceleration vs arc length |
+| `plot_path_s_and_position_over_time()` | spline progress & XY position |
+
+Simulation output includes static plots and the animated GIF shown above.
+
+---
+
+## ▶ Running the Project
+
+Install dependencies:
+
+```bash
+pip install numpy matplotlib scipy casadi
